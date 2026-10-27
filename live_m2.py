@@ -1177,7 +1177,7 @@ def page_file(topic, refresh, fol, fname):
                 nxt = next_candle_close(s, now)
                 st.info(f"Waiting for the first candle that CLOSES after the start time ({s['start']}). "
                         f"Next candle closes at {nxt:%H:%M}{'' if nxt is not None and nxt.date() == now.date() else ('' if nxt is None else nxt.strftime(' %d %b'))}. "
-                        'If that candle closes ABOVE the cloud, lot 1 is bought.')
+                        f"If that candle closes {entry_text(s).upper()}, lot 1 is bought.")
                 if dg['cloud'] is None:
                     st.warning(f"Cloud not ready: {dg['bars']} closed bars loaded, need 78+ (Angel returned too little history).")
                 else:
