@@ -1420,7 +1420,7 @@ div[data-testid='stPopover'] button:hover{border-color:rgba(255,75,75,.6)}
 
 
 def main():
-    st.set_page_config(page_title='Live Paper Trading', layout='wide')
+    st.set_page_config(page_title='Live Paper Trading', layout='wide', initial_sidebar_state='expanded')
     st.markdown(GLOBAL_CSS, unsafe_allow_html=True)
 
     # ---- login screen (nothing is stored on the server)
@@ -1446,15 +1446,15 @@ def main():
         return
 
     page = st.session_state.setdefault('page', 'strategies')      # ---- top navigation
-    n1, n2, _ = st.columns([1.3, 1.5, 4])
-    if n1.button('📁 My Strategies', type='primary' if page == 'strategies' else 'secondary', width='stretch'):
-        st.session_state['page'] = 'strategies'
-        st.session_state.pop('open_file', None)
-        st.rerun()
-    if n2.button('🛠️ Strategy Builder', type='primary' if page == 'builder' else 'secondary', width='stretch'):
-        st.session_state['page'] = 'builder'
-        st.rerun()
-    st.divider()
+    with st.sidebar:                                              # navigation on the left side
+        st.markdown('### Live Paper Trading')
+        if st.button('📁 My Strategies', type='primary' if page == 'strategies' else 'secondary', width='stretch'):
+            st.session_state['page'] = 'strategies'
+            st.session_state.pop('open_file', None)
+            st.rerun()
+        if st.button('🛠️ Strategy Builder', type='primary' if page == 'builder' else 'secondary', width='stretch'):
+            st.session_state['page'] = 'builder'
+            st.rerun()
 
     if page == 'builder':
         page_builder()
