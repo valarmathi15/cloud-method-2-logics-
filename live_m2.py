@@ -65,6 +65,7 @@ CLOUD_EXIT = {'Above cloud': 'CloudAbove', 'Inside cloud': 'CloudInside', 'Below
 SPAN_OPTIONS = {**SPAN_ONLY, **CLOUD_EXIT}                      # every non-% exit (stored in the file as `span`)
 EXIT_OPTIONS = TARGET_OPTIONS + list(SPAN_OPTIONS)               # profit target % + span exits + cloud exits
 ENTRY_OPTIONS = {'Above cloud': 'above', 'Inside cloud': 'inside', 'Below cloud': 'below'}
+METHOD_OPTIONS = {'Method 1 - exit at any lot count': 1, 'Method 2 - exit only after Max lots filled': 2}
 AMOUNT_OPTIONS = [1000, 5000, 10000, 25000, 50000, 100000, 200000, 500000]
 QTY_OPTIONS = [1, 2, 5, 10, 25, 50, 75, 100, 150, 200, 500, 1000]
 CANDLE_OPTIONS = {'Every candle': 'every', 'Daily': 'daily', 'Weekly': 'weekly'}
@@ -78,6 +79,10 @@ def size_text(s):
     if s.get('amount'):
         return f"{'equal-weight ' if s.get('sizing') == 'equal' else ''}amount/lot {s['amount']:,.0f}"
     return f"qty/lot {s['qty']:g}"
+
+
+def method_text(s):
+    return f"method {int(s.get('method', 1))}"
 
 
 def entry_text(s):
@@ -122,11 +127,13 @@ SPAN_TEXT = {'A': 'Span A', 'B': 'Span B', 'A&B': 'Span A & B', 'AorB': 'Span A 
              'CloudAbove': 'the cloud top', 'CloudBelow': 'the cloud bottom', 'CloudInside': 'the cloud'}
 
 
-def run_m2(df, profit_target_pct, max_lots, start_date=None, lot_qty=1.0, trace=None, span=None, candle='every', lot_amount=None, skip=None, entry='above'):
+def run_m2(df, profit_target_pct, max_lots, start_date=None, lot_qty=1.0, trace=None, span=None, candle='every', lot_amount=None, skip=None, entry='above', method=1):
     """Method 2 (Google-sheet logic).
     span   : None = exit on Profit target %;  'A' / 'B' / 'A&B' / 'AorB' = exit when Close falls below that span
              (whole position closed; span exits go flat, no repeat exits).
     lot_amount : None = every lot buys `lot_qty` units;  number = every lot invests this AMOUNT (units = amount / lot price).
+    method : 1 = profit target can exit at ANY lot count;  2 = profit target is checked ONLY once all Max lots are filled
+             (span / cloud exits stay active at any lot count).
     entry  : 'above' = buy while Close is ABOVE the cloud top;  'below' = BELOW the cloud bottom;  'inside' = INSIDE the cloud.
     skip   : list of (from, to) timestamps - bars inside are ignored (strategy was paused; no buy / exit then).
     candle : 'every' = buy 1 lot on every candle above the cloud;  'daily' = at most 1 lot per day;
@@ -147,7 +154,8 @@ def run_m2(df, profit_target_pct, max_lots, start_date=None, lot_qty=1.0, trace=
         return None
 
     exit_reason = (({'CloudAbove': 'Closed above the cloud (Method 2)', 'CloudInside': 'Closed inside the cloud (Method 2)'}.get(span) or f'Closed below {SPAN_TEXT[span]} (Method 2)') if span_hit
-                   else f'Profit target {profit_target_pct}% hit (Method 2 - sheet logic)')
+                   else (f'Profit target {profit_target_pct}% hit after all {max_lots} lots filled (Method 2)' if method == 2
+                         else f'Profit target {profit_target_pct}% hit (Method 1 - sheet logic)'))
     trades = []
     trade_id = 0
     m2_first, m2_lots, m2_avg, m2_prev_exit, m2_seg_start = True, 0, None, False, None
@@ -198,7 +206,7 @@ def run_m2(df, profit_target_pct, max_lots, start_date=None, lot_qty=1.0, trace=
             if span_hit:
                 hit = span_hit(price, row['SenkouA'], row['SenkouB'])
             else:
-                hit = (price - m2_avg) / m2_avg >= profit_target_pct / 100.0
+                hit = (price - m2_avg) / m2_avg >= profit_target_pct / 100.0 and (method != 2 or m2_lots >= max_lots)
             if hit:
                 trade_id += 1
                 trades.append({
@@ -523,9 +531,9 @@ def prepare(raw, tf, close_t, now):
 
 
 # =============================================================== M2 live state
-def compute_m2(df, profit_pct, max_lots, start, qty=1.0, span=None, candle='every', amount=None, skip=None, entry='above'):
+def compute_m2(df, profit_pct, max_lots, start, qty=1.0, span=None, candle='every', amount=None, skip=None, entry='above', method=1):
     trace = []
-    trades = run_m2(df, profit_pct, max_lots, start_date=start, lot_qty=qty, trace=trace, span=span, candle=candle, lot_amount=amount, skip=skip, entry=entry)
+    trades = run_m2(df, profit_pct, max_lots, start_date=start, lot_qty=qty, trace=trace, span=span, candle=candle, lot_amount=amount, skip=skip, entry=entry, method=method)
     tr = pd.DataFrame(trace)
     if tr.empty:
         return tr, trades
@@ -587,7 +595,7 @@ def delete_strategy(folder, fname):
     os.remove(os.path.join(user_dir(), safe(folder), fname))
 
 
-def create_strategies(folder, prefix, exchange, symbols, tfs, capital, sizes, close, lots_list, exits, candles, start, entries=('above',)):
+def create_strategies(folder, prefix, exchange, symbols, tfs, capital, sizes, close, lots_list, exits, candles, start, entries=('above',), methods=(1,)):
     """one file per symbol x timeframe x lots x size x exit option x candle mode. Existing file is NOT overwritten (keeps its start time)."""
     d = os.path.join(user_dir(), safe(folder))
     os.makedirs(d, exist_ok=True)
@@ -598,13 +606,15 @@ def create_strategies(folder, prefix, exchange, symbols, tfs, capital, sizes, cl
           for kind, val in sizes:
             for ex in exits:
               for ent in entries:
+               for mth in methods:
                 for cd in candles:
                     cdc = CANDLE_OPTIONS[cd]
                     amt = capital / len(symbols) / lots if kind == 'eq' else val      # equal weightage: capital / symbols / max lots
                     name = (f"{prefix + ' ' if prefix else ''}{sym} {tf} {lots}lots {exit_label(ex)}"
                             + ('' if cdc == 'every' else f' {cdc}')
                             + (f' amt{val:g}' if kind == 'amt' else (' eq' if kind == 'eq' else (f' q{val:g}' if len(sizes) > 1 else '')))
-                            + {'below': ' belowcloud', 'inside': ' insidecloud'}.get(ent, ''))
+                            + {'below': ' belowcloud', 'inside': ' insidecloud'}.get(ent, '')
+                            + (' method2' if mth == 2 else ''))
                     path = os.path.join(d, safe(name) + '.json')
                     if os.path.exists(path):
                         skipped.append(name)
@@ -614,7 +624,7 @@ def create_strategies(folder, prefix, exchange, symbols, tfs, capital, sizes, cl
                          'tf': tf, 'profit': None if is_span else ex, 'span': SPAN_OPTIONS.get(ex),
                          'exit_label': exit_label(ex), 'candle': cdc, 'lots': lots, 'capital': capital,
                          'qty': val if kind == 'qty' else 1.0, 'amount': amt if kind in ('amt', 'eq') else None,
-                         'sizing': 'equal' if kind == 'eq' else ('amount' if kind == 'amt' else 'qty'), 'entry': ent,
+                         'sizing': 'equal' if kind == 'eq' else ('amount' if kind == 'amt' else 'qty'), 'entry': ent, 'method': mth,
                          'close': close, 'start': start,
                          'created': now_ist().to_pydatetime().strftime('%Y-%m-%d %H:%M')}
                     with open(path, 'w', encoding='utf-8') as f:
@@ -657,7 +667,7 @@ def evaluate(s):
     skip = [(pd.Timestamp(a), pd.Timestamp(b)) for a, b in s.get('gaps', [])]
     eff_start = first_bar_after_start(df, s['tf'], dt.time(h, m), s['start'])
     tr, trades = compute_m2(df, s.get('profit') or 0.0, int(s['lots']), eff_start if eff_start is not None else pd.Timestamp('2100-01-01'),
-                            s['qty'], span=s.get('span'), candle=s.get('candle', 'every'), amount=s.get('amount'), skip=skip, entry=s.get('entry', 'above'))
+                            s['qty'], span=s.get('span'), candle=s.get('candle', 'every'), amount=s.get('amount'), skip=skip, entry=s.get('entry', 'above'), method=int(s.get('method', 1)))
     diag = {'bars': len(df), 'last_bar': None if df.empty else df['Date'].iloc[-1], 'cloud': None}
     if len(df):
         try:
@@ -797,7 +807,7 @@ def page_builder():
             tfs = checkbox_dropdown('Select timeframe', list(TF), ['1D'], 'tf')
 
         with st.container(border=True):                       # ---- ENTRY CONDITION
-            section_title('Entry condition', 'Ichimoku cloud, Method 2 - index, stocks, candle, position size (live: starts from now)')
+            section_title('Entry condition', 'Ichimoku cloud - method, index, stocks, candle, position size (live: starts from now)')
             picked = []
             groups = list(instrument_choices(exchange).items())
             cols = st.columns(len(groups) + 1)
@@ -811,6 +821,10 @@ def page_builder():
                                           placeholder='Nifty 50, RELIANCE, GOLDM05DEC25FUT',
                                           help='Index: Nifty 50  |  Stock: RELIANCE (or RELIANCE-EQ)  |  MCX: exact future symbol. '
                                                'Typed names are added to the ticked ones.')
+            lbl('Entry method (one file each)')
+            methods = [METHOD_OPTIONS[x] for x in checkbox_dropdown('Select method', list(METHOD_OPTIONS), ['Method 1 - exit at any lot count'], 'method')]
+            st.caption('Method 1: profit target exits at ANY lot count.  Method 2: profit target is checked only AFTER all Max lots are filled '
+                       '(span / cloud exits still work any time).')
             c1, c2, c3, c4 = st.columns(4)
             with c1:
                 lbl('Max lots (one file each)')
@@ -878,9 +892,9 @@ def page_builder():
             if x.upper() not in seen:
                 seen.add(x.upper())
                 symbols.append(x)
-        n = len(symbols) * len(tfs) * len(lots_list) * len(sizes) * len(targets) * len(candles) * len(entries)
+        n = len(symbols) * len(tfs) * len(lots_list) * len(sizes) * len(targets) * len(candles) * len(entries) * len(methods)
         st.caption(f'{len(symbols)} symbol(s) x {len(tfs)} timeframe(s) x {len(lots_list)} lots x {len(sizes)} size(s) x '
-                   f'{len(targets)} exits x {len(candles)} candle mode(s) x {len(entries)} entry side(s) = {n} file(s) will be saved.  Start = {start}  '
+                   f'{len(targets)} exits x {len(candles)} candle mode(s) x {len(entries)} entry side(s) x {len(methods)} method(s) = {n} file(s) will be saved.  Start = {start}  '
                    f'(live - first candle that closes after this)')
         st.caption('Live trading (real orders) is not included - run Paper first and check the numbers.')
         if st.button('▶ Start', type='primary'):
@@ -888,7 +902,7 @@ def page_builder():
             if not fname:
                 st.error('Give a folder name.')
             elif n == 0:
-                st.error('Pick (or type) at least one symbol, timeframe, Max lots, position size, entry side, candle option and exit option.')
+                st.error('Pick (or type) at least one symbol, timeframe, entry method, Max lots, position size, entry side, candle option and exit option.')
             elif n > 150:
                 st.error('Too many files (max 150 at a time).')
             else:
@@ -899,7 +913,7 @@ def page_builder():
                     st.error(str(e))
                     return
                 made, skipped = create_strategies(fname, (prefix or '').strip(), exchange, symbols, tfs, capital, sizes,
-                                                  close_t.strftime('%H:%M'), lots_list, targets, candles, start, entries)
+                                                  close_t.strftime('%H:%M'), lots_list, targets, candles, start, entries, methods)
                 if made:
                     st.success(f'Saved {len(made)} file(s) in folder "{fname}". Open "My Strategies" to watch them live.')
                 if skipped:
@@ -1080,7 +1094,7 @@ def page_file(topic, refresh, fol, fname):
 
         size = size_text(s)
         st.info(f"**{s['exchange']}** | {s['symbol']} | {s['tf']} | capital {s['capital']:,.0f} | max lots {s['lots']} | {size} | "
-                f"entry {entry_text(s)} | exit {exit_text(s)} | buy {candle_text(s).lower()} | started {s['start']}")
+                f"{method_text(s)} | entry {entry_text(s)} | exit {exit_text(s)} | buy {candle_text(s).lower()} | started {s['start']}")
 
         with st.expander('Edit settings (running-ah irundhaalum maathalaam)'):
             e1, e2, e3 = st.columns(3)
@@ -1097,11 +1111,13 @@ def page_file(topic, refresh, fol, fname):
             val = e2.number_input('Quantity per lot' if by == 'Quantity' else 'Amount per lot', min_value=0.0,
                                   value=float(s['amount'] if s.get('amount') else s['qty']), key=f'ed_val_{fname}_{by}')
             new_cap = e3.number_input('Capital', min_value=0.0, value=float(s['capital']), step=10000.0, key=f'ed_cap_{fname}')
+            new_method = st.selectbox('Entry method', list(METHOD_OPTIONS), index=int(s.get('method', 1)) - 1, key=f'ed_mth_{fname}')
             new_entry = st.selectbox('Entry', list(ENTRY_OPTIONS), index=list(ENTRY_OPTIONS.values()).index(s.get('entry', 'above')), key=f'ed_ent_{fname}')
             st.caption('Numbers are re-calculated from the start time with the new settings.')
             if st.button('Save settings', key=f'ed_save_{fname}'):
                 s['lots'], s['capital'], s['candle'] = int(new_lots), new_cap, CANDLE_OPTIONS[new_cd]
                 s['entry'] = ENTRY_OPTIONS[new_entry]
+                s['method'] = METHOD_OPTIONS[new_method]
                 s['profit'] = None if new_ex in SPAN_OPTIONS else new_ex
                 s['span'] = SPAN_OPTIONS.get(new_ex)
                 s['exit_label'] = exit_label(new_ex)
@@ -1361,7 +1377,7 @@ def page_view(topic, refresh):
                         st.session_state['open_file'] = (fol, f)
                         st.rerun()
                     size = size_text(s)
-                    r[0].caption(f"{s['exchange']} · {s['tf']} · {s['lots']} lots · entry {entry_text(s)} · exit {exit_text(s)} · {candle_text(s).lower()} · {size} · capital {s['capital']:g} · started {s['start']}")
+                    r[0].caption(f"{s['exchange']} · {s['tf']} · {s['lots']} lots · {method_text(s)} · entry {entry_text(s)} · exit {exit_text(s)} · {candle_text(s).lower()} · {size} · capital {s['capital']:g} · started {s['start']}")
                     r[1].write(s['symbol'])
                     if not s.get('stopped'):
                         try:
@@ -1409,7 +1425,7 @@ def main():
 
     # ---- login screen (nothing is stored on the server)
     if 'creds' not in st.session_state:
-        st.title('Live Paper Trading - Method 2')
+        st.title('Live Paper Trading')
         st.subheader('Enter your Angel One details')
         api_key = st.text_input('API key', type='password')
         client_id = st.text_input('Client ID')
