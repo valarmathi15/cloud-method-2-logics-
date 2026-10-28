@@ -18,6 +18,7 @@ Strategy files are saved in the  strategies/<ClientID>/<folder>/  folder next to
 NOTE: on Streamlit Cloud that folder is wiped when the app reboots - run it on your own PC to keep files.
 """
 import datetime as dt
+import heapq
 import io
 import json
 import os
@@ -82,6 +83,11 @@ def size_text(s):
     return f"qty/lot {s['qty']:g}"
 
 
+def limit_text(s):
+    g = s.get('group') or {}
+    return f"max {g['limit']} stocks at a time" if g.get('limit') else 'no stock limit'
+
+
 def method_text(s):
     return f"method {int(s.get('method', 1))}"
 
@@ -128,8 +134,11 @@ SPAN_TEXT = {'A': 'Span A', 'B': 'Span B', 'A&B': 'Span A & B', 'AorB': 'Span A 
              'CloudAbove': 'the cloud top', 'CloudBelow': 'the cloud bottom', 'CloudInside': 'the cloud'}
 
 
-def run_m2(df, profit_target_pct, max_lots, start_date=None, lot_qty=1.0, trace=None, span=None, candle='every', lot_amount=None, skip=None, entry='above', method=1):
-    """Method 2 (Google-sheet logic).
+def m2_gen(df, profit_target_pct, max_lots, start_date=None, lot_qty=1.0, trace=None, span=None, candle='every', lot_amount=None, skip=None, entry='above', method=1, state=None):
+    """GENERATOR version of Method 2. Yields ('NEXT', bar_date) before every bar and ('ASK', bar_date) when a FLAT stock wants to
+    open a NEW position - the caller answers True / False (portfolio limit). state['lots'] always shows the lots held.
+    run_m2() below drives it for one stock; run_group() drives many stocks in time order.
+    Method 2 (Google-sheet logic).
     span   : None = exit on Profit target %;  'A' / 'B' / 'A&B' / 'AorB' = exit when Close falls below that span
              (whole position closed; span exits go flat, no repeat exits).
     lot_amount : None = every lot buys `lot_qty` units;  number = every lot invests this AMOUNT (units = amount / lot price).
@@ -159,6 +168,9 @@ def run_m2(df, profit_target_pct, max_lots, start_date=None, lot_qty=1.0, trace=
                          else f'Profit target {profit_target_pct}% hit (Method 1 - sheet logic)'))
     trades = []
     trade_id = 0
+    if state is None:
+        state = {}
+    state['lots'] = 0
     m2_first, m2_lots, m2_avg, m2_prev_exit, m2_seg_start = True, 0, None, False, None
     m2_qty, m2_cost = 0.0, 0.0                     # units held and money spent (avg price = cost / units)
     last_buy_key = None
@@ -169,16 +181,21 @@ def run_m2(df, profit_target_pct, max_lots, start_date=None, lot_qty=1.0, trace=
         price, date = row['Close'], row['Date']
         if skip and any(a < date < b for a, b in skip):
             continue
+        yield ('NEXT', date)
         if entry == 'above':                                                                       # entry condition met?
             above = bool(row['AboveCloud'])
         elif entry == 'below':
             above = bool(price < row['CloudBottom'])
         else:                                                                                      # inside the cloud
             above = bool(row['CloudBottom'] <= price <= row['CloudTop'])
-        bought, prev_lots = False, 0
+        bought, prev_lots, blocked = False, 0, False
         if m2_first:
             m2_first = False
-            m2_lots = 1 if above else 0
+            if above:
+                if (yield ('ASK', date)):
+                    m2_lots = 1
+                else:
+                    blocked = True                          # portfolio full -> no new position on this bar
             bought = m2_lots == 1
             if m2_lots == 1:
                 last_buy_key = pkey(date)
@@ -187,6 +204,8 @@ def run_m2(df, profit_target_pct, max_lots, start_date=None, lot_qty=1.0, trace=
             can_buy = candle == 'every' or pkey(date) != last_buy_key
             if not above or not can_buy:
                 pass
+            elif m2_lots == 0 and not (yield ('ASK', date)):
+                blocked = True                              # flat stock, but the portfolio limit is reached
             elif m2_prev_exit:
                 m2_lots, bought = 1, True
             elif m2_lots < max_lots:
@@ -221,9 +240,10 @@ def run_m2(df, profit_target_pct, max_lots, start_date=None, lot_qty=1.0, trace=
                 m2_prev_exit = True
                 m2_seg_start = None
                 m2_lots, m2_avg, m2_qty, m2_cost = 0, None, 0.0, 0.0   # exit = flat; fresh trade on the next close above cloud
+        state['lots'] = m2_lots
         if trace is not None:
             trace.append({'Date': date, 'Close': price, 'CloudTop': row['CloudTop'],
-                          'CloudBottom': row['CloudBottom'], 'Above': above, 'Lots': m2_lots, 'Bought': bought, 'Qty': m2_qty,
+                          'CloudBottom': row['CloudBottom'], 'Above': above, 'Lots': m2_lots, 'Bought': bought, 'Blocked': blocked, 'Qty': m2_qty,
                           'AvgPrice': None if not m2_avg else round(m2_avg, 4),
                           'Action': 'EXIT' if m2_prev_exit else ''})
 
@@ -239,6 +259,43 @@ def run_m2(df, profit_target_pct, max_lots, start_date=None, lot_qty=1.0, trace=
             'PnL (pts x qty)': round((price - m2_avg) * m2_qty, 2),
             'Exit Reason': 'Open at end of data (marked to last close)'})
     return pd.DataFrame(trades)
+
+
+def run_m2(*a, **k):
+    """one stock on its own (no portfolio limit) -> trades DataFrame; trace (list) gets one dict per bar."""
+    g = m2_gen(*a, **k)
+    try:
+        msg = next(g)
+        while True:
+            msg = g.send(True if msg[0] == 'ASK' else None)
+    except StopIteration as e:
+        return e.value
+
+
+def run_group(items, limit):
+    """Step many stocks together in TIME order. A flat stock may open a new position only while fewer than `limit` stocks
+    hold one; stocks that already hold lots keep scaling in. Same bar -> list order. -> {index: trades DataFrame}"""
+    heap, results = [], {}
+    for i, it in enumerate(items):
+        try:
+            msg = next(it['g'])
+            heapq.heappush(heap, (msg[1], i))
+        except StopIteration as e:
+            results[i] = e.value
+    while heap:
+        _, i = heapq.heappop(heap)
+        it = items[i]
+        try:
+            msg = it['g'].send(None)                                   # process this bar
+            while msg[0] == 'ASK':
+                held = sum(1 for j, o in enumerate(items) if j != i and o['state']['lots'] > 0)
+                msg = it['g'].send(held < limit)
+            heapq.heappush(heap, (msg[1], i))
+        except StopIteration as e:
+            results[i] = e.value
+            if it.get('stopped'):                                      # exited strategy: its slot is free from now on
+                it['state']['lots'] = 0
+    return results
 
 
 # =============================================================== DATA FEED (Angel One SmartAPI)
@@ -532,21 +589,23 @@ def prepare(raw, tf, close_t, now):
 
 
 # =============================================================== M2 live state
-def compute_m2(df, profit_pct, max_lots, start, qty=1.0, span=None, candle='every', amount=None, skip=None, entry='above', method=1):
-    trace = []
-    trades = run_m2(df, profit_pct, max_lots, start_date=start, lot_qty=qty, trace=trace, span=span, candle=candle, lot_amount=amount, skip=skip, entry=entry, method=method)
+def build_tr(trace):
     tr = pd.DataFrame(trace)
     if tr.empty:
-        return tr, trades
-    prev_lots = tr['Lots'].shift(fill_value=0)
-    prev_exit = tr['Action'].shift(fill_value='') == 'EXIT'
+        return tr
     buy = tr['Bought'].astype(bool)
     exit_ = tr['Action'] == 'EXIT'
     tr['Signal'] = np.select([buy & exit_, exit_, buy], ['BUY+EXIT', 'EXIT', 'BUY'], 'HOLD')
     for col in ('AvgPrice', 'Qty'):                          # never bought -> column was all None (object) -> .round() crashed
         tr[col] = pd.to_numeric(tr[col], errors='coerce')
     tr['Unrealised %'] = ((tr['Close'] - tr['AvgPrice']) / tr['AvgPrice'] * 100).round(2)
-    return tr, trades
+    return tr
+
+
+def compute_m2(df, profit_pct, max_lots, start, qty=1.0, span=None, candle='every', amount=None, skip=None, entry='above', method=1):
+    trace = []
+    trades = run_m2(df, profit_pct, max_lots, start_date=start, lot_qty=qty, trace=trace, span=span, candle=candle, lot_amount=amount, skip=skip, entry=entry, method=method)
+    return build_tr(trace), trades
 
 
 def get_smart():
@@ -596,12 +655,12 @@ def delete_strategy(folder, fname):
     os.remove(os.path.join(user_dir(), safe(folder), fname))
 
 
-def create_strategies(folder, prefix, exchange, symbols, tfs, capital, sizes, close, lots_list, exits, candles, start, entries=('above',), methods=(1,)):
+def create_strategies(folder, prefix, exchange, symbols, tfs, capital, sizes, close, lots_list, exits, candles, start, entries=('above',), methods=(1,), max_open=0):
     """one file per symbol x timeframe x lots x size x exit option x candle mode. Existing file is NOT overwritten (keeps its start time)."""
     d = os.path.join(user_dir(), safe(folder))
     os.makedirs(d, exist_ok=True)
     made, skipped = [], []
-    for sym in symbols:
+    for rank, sym in enumerate(symbols):
       for tf in tfs:
         for lots in lots_list:
           for kind, val in sizes:
@@ -627,6 +686,8 @@ def create_strategies(folder, prefix, exchange, symbols, tfs, capital, sizes, cl
                          'qty': val if kind == 'qty' else 1.0, 'amount': amt if kind in ('amt', 'eq') else None,
                          'sizing': 'equal' if kind == 'eq' else ('amount' if kind == 'amt' else 'qty'), 'entry': ent, 'method': mth,
                          'close': close, 'start': start,
+                         'group': ({'id': f"{start}|{tf}|{lots}|{kind}{val}|{ex}|{ent}|{mth}|{cdc}", 'limit': int(max_open), 'rank': rank}
+                                   if max_open else None),
                          'created': now_ist().to_pydatetime().strftime('%Y-%m-%d %H:%M')}
                     with open(path, 'w', encoding='utf-8') as f:
                         json.dump(s, f, indent=1)
@@ -659,16 +720,17 @@ def first_bar_after_start(df, tf, close_t, start):
     return None if ok.empty else ok['Date'].iloc[0]
 
 
-def evaluate(s):
-    """-> dict with tr (bar log), trades and the numbers shown in the summary."""
+def _eval_prepare(s):
+    """candles -> closed bars + the numbers needed to run the engine for one strategy."""
     h, m = [int(x) for x in s['close'].split(':')]
     raw, checked, data_err = get_candles(s)
-    now = pd.Timestamp(s['paused_at']) if s.get('paused_at') else now_ist()      # paused = frozen as of that moment
+    if s.get('stopped'):                                           # exited: only needed so the portfolio slots stay correct
+        now = pd.Timestamp(s.get('final', {}).get('at') or now_ist())
+    else:
+        now = pd.Timestamp(s['paused_at']) if s.get('paused_at') else now_ist()      # paused = frozen as of that moment
     df = prepare(raw, s['tf'], dt.time(h, m), now)
     skip = [(pd.Timestamp(a), pd.Timestamp(b)) for a, b in s.get('gaps', [])]
     eff_start = first_bar_after_start(df, s['tf'], dt.time(h, m), s['start'])
-    tr, trades = compute_m2(df, s.get('profit') or 0.0, int(s['lots']), eff_start if eff_start is not None else pd.Timestamp('2100-01-01'),
-                            s['qty'], span=s.get('span'), candle=s.get('candle', 'every'), amount=s.get('amount'), skip=skip, entry=s.get('entry', 'above'), method=int(s.get('method', 1)))
     diag = {'bars': len(df), 'last_bar': None if df.empty else df['Date'].iloc[-1], 'cloud': None}
     if len(df):
         try:
@@ -678,8 +740,20 @@ def evaluate(s):
                                  'pos': 'Above cloud' if cl['Close'] > cl['CloudTop'] else ('Below cloud' if cl['Close'] < cl['CloudBottom'] else 'Inside cloud')}
         except Exception:
             pass
-    out = {'s': s, 'diag': diag, 'tr': tr, 'trades': trades, 'status': 'Waiting for 1st candle', 'last': None,
-           'checked': checked, 'data_err': data_err,
+    return {'df': df, 'skip': skip, 'eff_start': eff_start if eff_start is not None else pd.Timestamp('2100-01-01'),
+            'checked': checked, 'data_err': data_err, 'diag': diag}
+
+
+def _eval_gen(s, ctx, trace, state):
+    return m2_gen(ctx['df'], s.get('profit') or 0.0, int(s['lots']), start_date=ctx['eff_start'], lot_qty=s['qty'], trace=trace,
+                  span=s.get('span'), candle=s.get('candle', 'every'), lot_amount=s.get('amount'), skip=ctx['skip'],
+                  entry=s.get('entry', 'above'), method=int(s.get('method', 1)), state=state)
+
+
+def _eval_finish(s, ctx, trace, trades):
+    tr = build_tr(trace)
+    out = {'s': s, 'diag': ctx['diag'], 'tr': tr, 'trades': trades, 'status': 'Waiting for 1st candle', 'last': None,
+           'checked': ctx['checked'], 'data_err': ctx['data_err'],
            'closed_n': 0, 'closed_pnl': 0.0, 'open_pnl': 0.0, 'invested': 0.0}
     if tr.empty:
         return out
@@ -692,7 +766,63 @@ def evaluate(s):
                open_pnl=0.0 if flat or openrows.empty else float(openrows['PnL (pts x qty)'].sum()),
                invested=0.0 if flat else float(last['Qty']) * float(last['AvgPrice']),
                status='Flat' if flat else f"Holding {int(last['Lots'])} lots")
+    if flat and bool(last.get('Blocked', False)):
+        out['status'] = f"Flat - portfolio full (limit {(s.get('group') or {}).get('limit', '?')})"
     return out
+
+
+def evaluate(s):
+    """-> dict with tr (bar log), trades and the numbers shown in the summary."""
+    ctx = _eval_prepare(s)
+    trace, st_ = [], {'lots': 0}
+    trades = run_m2(ctx['df'], s.get('profit') or 0.0, int(s['lots']), start_date=ctx['eff_start'], lot_qty=s['qty'], trace=trace,
+                    span=s.get('span'), candle=s.get('candle', 'every'), lot_amount=s.get('amount'), skip=ctx['skip'],
+                    entry=s.get('entry', 'above'), method=int(s.get('method', 1)))
+    return _eval_finish(s, ctx, trace, trades)
+
+
+def evaluate_group(strategies):
+    """All strategies of ONE portfolio group (same settings, different stocks) simulated together so the
+    'max open stocks' limit is applied in time order.  -> {strategy name: ev dict  or  Exception}"""
+    limit = int((strategies[0].get('group') or {}).get('limit') or 0) or 10 ** 9
+    out, items, ctxs = {}, [], []
+    for s in strategies:
+        try:
+            ctxs.append(_eval_prepare(s))
+        except Exception as e:
+            out[s['name']] = e
+            continue
+        tr, stt = [], {'lots': 0}
+        items.append({'s': s, 'trace': tr, 'state': stt, 'stopped': bool(s.get('stopped')), 'g': _eval_gen(s, ctxs[-1], tr, stt)})
+    results = run_group(items, limit)
+    for i, it in enumerate(items):
+        out[it['s']['name']] = _eval_finish(it['s'], ctxs[i], it['trace'], results[i])
+    return out
+
+
+def group_members(folder, s):
+    g = s.get('group') or {}
+    members = []
+    for f in list_files(folder):
+        try:
+            m = load_strategy(folder, f)
+        except Exception:
+            continue
+        if (m.get('group') or {}).get('id') == g.get('id'):
+            members.append(m)
+    members.sort(key=lambda m: ((m.get('group') or {}).get('rank', 0), m['name']))
+    return members
+
+
+def evaluate_any(folder, s):
+    """evaluate one strategy - inside its portfolio group when it has a limit."""
+    g = s.get('group')
+    if not (g and g.get('limit')):
+        return evaluate(s)
+    r = evaluate_group(group_members(folder, s))[s['name']]
+    if isinstance(r, Exception):
+        raise r
+    return r
 
 
 def money(x):
@@ -927,7 +1057,7 @@ def page_builder():
             methods = [METHOD_OPTIONS[x] for x in checkbox_dropdown('Select method', list(METHOD_OPTIONS), ['Method 1 - exit at any lot count'], 'method')]
             st.caption('Method 1: profit target exits at ANY lot count.  Method 2: profit target is checked only AFTER all Max lots are filled '
                        '(span / cloud exits still work any time).')
-            c1, c2, c3 = st.columns(3)
+            c1, c2, c3, c4 = st.columns(4)
             with c1:
                 lbl('Max lots (one file each)')
                 lots_list = checkbox_dropdown('Select lots', LOTS_OPTIONS, [10], 'lots')
@@ -937,6 +1067,16 @@ def page_builder():
             with c3:
                 lbl('Price vs cloud (one file each)')
                 entries = [ENTRY_OPTIONS[x] for x in checkbox_dropdown('Select entry', list(ENTRY_OPTIONS), ['Above cloud'], 'entry')]
+            with c4:
+                lbl('Max stocks open at a time')
+                max_open = st.number_input('Max stocks open at a time', min_value=0, max_value=500, value=0, step=1,
+                                           label_visibility='collapsed',
+                                           help='0 = no limit. Example: 50 stocks selected, limit 10 -> only the first 10 stocks that give an entry are '
+                                                'taken. Another stock can enter only when one of the open stocks has fully exited. '
+                                                'Stocks already open can still add lots up to Max lots.')
+            if max_open:
+                st.caption(f'Portfolio limit {max_open}: at most {max_open} stocks hold a position together (separately for every '
+                           f'timeframe / lots / exit / entry / method combination). A waiting stock enters when a slot frees up.')
             close_t = dt.time(23, 30) if exchange == 'MCX' else dt.time(15, 30)      # fixed by exchange (no input box)
             c = st.columns(3)
             with c[0]:
@@ -1003,7 +1143,7 @@ def page_builder():
                     st.error(str(e))
                     return
                 made, skipped = create_strategies(fname, (prefix or '').strip(), exchange, symbols, tfs, capital, sizes,
-                                                  close_t.strftime('%H:%M'), lots_list, targets, candles, start, entries, methods)
+                                                  close_t.strftime('%H:%M'), lots_list, targets, candles, start, entries, methods, int(max_open))
                 if made:
                     st.success(f'Saved {len(made)} file(s) in folder "{fname}". Open "My Strategies" to watch them live.')
                 if skipped:
@@ -1175,7 +1315,7 @@ def page_file(topic, refresh, fol, fname):
             st.write('Close the open position at the last closed price and stop for good')
             if st.button('✔ Yes', key=f'ex_{fname}', type='primary'):
                 try:
-                    ev_ = evaluate(s)
+                    ev_ = evaluate_any(fol, s)
                 except Exception:
                     ev_ = None
                 exit_strategy(fol, fname, ev_)
@@ -1184,7 +1324,7 @@ def page_file(topic, refresh, fol, fname):
 
         size = size_text(s)
         st.info(f"**{s['exchange']}** | {s['symbol']} | {s['tf']} | capital {s['capital']:,.0f} | max lots {s['lots']} | {size} | "
-                f"{method_text(s)} | entry {entry_text(s)} | exit {exit_text(s)} | buy {candle_text(s).lower()} | started {s['start']}")
+                f"{method_text(s)} | entry {entry_text(s)} | exit {exit_text(s)} | buy {candle_text(s).lower()} | {limit_text(s)} | started {s['start']}")
 
         with st.expander('Edit settings (running-ah irundhaalum maathalaam)'):
             e1, e2, e3 = st.columns(3)
@@ -1228,7 +1368,7 @@ def page_file(topic, refresh, fol, fname):
             ev = None
         else:
             try:
-                ev = evaluate(s)
+                ev = evaluate_any(fol, s)
             except Exception as e:
                 st.error(f'Could not load data: {e}')
                 return
@@ -1381,15 +1521,33 @@ def page_view(topic, refresh):
             st.info('No folders yet. Create one above or in Strategy Builder.')
             return
 
-        evs, errs = {}, {}
+        evs, errs, groups = {}, {}, {}
         for fol in shown:                                          # evaluate (candles are cached, only newest ones refetched)
             for f, s in data[fol]:
+                g = s.get('group')
+                if g and g.get('limit'):                           # stocks with a portfolio limit are simulated TOGETHER
+                    groups.setdefault((fol, g['id']), []).append((f, s))
+                    continue
                 if s.get('stopped'):
                     continue
                 try:
                     evs[(fol, f)] = evaluate(s)
                 except Exception as e:
                     errs[(fol, f)] = str(e)
+        for (fol, gid), members in groups.items():
+            members.sort(key=lambda fs: ((fs[1].get('group') or {}).get('rank', 0), fs[1]['name']))
+            try:
+                res = evaluate_group([s for _, s in members])
+            except Exception as e:
+                for f, s in members:
+                    errs[(fol, f)] = str(e)
+                continue
+            for f, s in members:
+                r = res.get(s['name'])
+                if isinstance(r, Exception):
+                    errs[(fol, f)] = str(r)
+                elif not s.get('stopped'):
+                    evs[(fol, f)] = r
         # ---- one-line live status
         now = now_ist().to_pydatetime()
         any_s = next((s for fol in shown for _, s in data[fol] if not s.get('stopped')), None)
@@ -1467,7 +1625,7 @@ def page_view(topic, refresh):
                         st.session_state['open_file'] = (fol, f)
                         st.rerun()
                     size = size_text(s)
-                    r[0].caption(f"{s['exchange']} · {s['tf']} · {s['lots']} lots · {method_text(s)} · entry {entry_text(s)} · exit {exit_text(s)} · {candle_text(s).lower()} · {size} · capital {s['capital']:g} · started {s['start']}")
+                    r[0].caption(f"{s['exchange']} · {s['tf']} · {s['lots']} lots · {method_text(s)} · entry {entry_text(s)} · exit {exit_text(s)} · {candle_text(s).lower()} · {size} · {limit_text(s)} · capital {s['capital']:,.0f} · started {s['start']}")
                     r[1].write(s['symbol'])
                     if not s.get('stopped'):
                         try:
