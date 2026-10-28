@@ -1,5 +1,5 @@
 """
-live_m2.py  -  LIVE PAPER TRADING : Method 2 (Cloud Scale-In, Google-sheet logic)   [single file]
+live_m2.py  -  LIVE PAPER TRADING : Method 1 / 2 / 3 (Cloud Scale-In, Google-sheet logic)   [single file]
 =====================================================================================
 BUILDER   : pick folder, exchange, symbols, candle timeframe, capital, qty, Max lots (many) and
             Target % (many)  ->  press Start  ->  ONE FILE is saved for every symbol x lots x target
@@ -70,7 +70,8 @@ CLOUD_EXIT = {'Above cloud': 'CloudAbove', 'Inside cloud': 'CloudInside', 'Below
 SPAN_OPTIONS = {**SPAN_ONLY, **CLOUD_EXIT}                      # every non-% exit (stored in the file as `span`)
 EXIT_OPTIONS = TARGET_OPTIONS + list(SPAN_OPTIONS)               # profit target % + span exits + cloud exits
 ENTRY_OPTIONS = {'Above cloud': 'above', 'Inside cloud': 'inside', 'Below cloud': 'below'}
-METHOD_OPTIONS = {'Method 1 - exit at any lot count': 1, 'Method 2 - exit only after Max lots filled': 2}
+METHOD_OPTIONS = {'Method 1 - exit at any lot count': 1, 'Method 2 - exit only after Max lots filled': 2,
+                  'Method 3 - exit only on the CROSSING day': 3}
 AMOUNT_OPTIONS = [1000, 5000, 10000, 25000, 50000, 100000, 200000, 500000]
 QTY_OPTIONS = [1, 2, 5, 10, 25, 50, 75, 100, 150, 200, 500, 1000]
 CANDLE_OPTIONS = {'Every candle': 'every', 'Daily': 'daily', 'Weekly': 'weekly'}
@@ -146,7 +147,14 @@ def m2_gen(df, profit_target_pct, max_lots, start_date=None, lot_qty=1.0, trace=
              (whole position closed; span exits go flat, no repeat exits).
     lot_amount : None = every lot buys `lot_qty` units;  number = every lot invests this AMOUNT (units = amount / lot price).
     method : 1 = profit target can exit at ANY lot count;  2 = profit target is checked ONLY once all Max lots are filled
-             (span / cloud exits stay active at any lot count).
+             (span / cloud exits stay active at any lot count);
+             3 = SCALE-IN + CROSSING-DAY EXIT (Google-sheet 'Assumptions / Logic'):
+                 - add 1 lot per bar while the entry condition holds, until Max lots (no profit gate on lots)
+                 - the whole position exits ONLY on the CROSSING day: exit condition true today AND NOT true on the previous bar
+                   (so a condition that was already true yesterday never fires late)
+                 - same-day rule: a lot bought on THIS bar counts as a fresh crossing -> if it brings the exit condition
+                   (e.g. profit % to target) true the same day, the exit fires the SAME day
+                 - after an exit the position is flat; a fresh trade starts the next time price closes above the cloud again
     entry  : 'above' = buy while Close is ABOVE the cloud top;  'below' = BELOW the cloud bottom;  'inside' = INSIDE the cloud.
     skip   : list of (from, to) timestamps - bars inside are ignored (strategy was paused; no buy / exit then).
     candle : 'every' = buy 1 lot on every candle above the cloud;  'daily' = at most 1 lot per day;
@@ -169,6 +177,9 @@ def m2_gen(df, profit_target_pct, max_lots, start_date=None, lot_qty=1.0, trace=
     exit_reason = (({'CloudAbove': 'Closed above the cloud (Method 2)', 'CloudInside': 'Closed inside the cloud (Method 2)'}.get(span) or f'Closed below {SPAN_TEXT[span]} (Method 2)') if span_hit
                    else (f'Profit target {profit_target_pct}% hit after all {max_lots} lots filled (Method 2)' if method == 2
                          else f'Profit target {profit_target_pct}% hit (Method 1 - sheet logic)'))
+    if method == 3:
+        exit_reason = (exit_reason.replace('(Method 2)', '(Method 3 - crossing day)') if span_hit
+                       else f'Profit target {profit_target_pct}% crossed (Method 3 - crossing day)')
     trades = []
     trade_id = 0
     if state is None:
@@ -177,6 +188,7 @@ def m2_gen(df, profit_target_pct, max_lots, start_date=None, lot_qty=1.0, trace=
     m2_first, m2_lots, m2_avg, m2_prev_exit, m2_seg_start = True, 0, None, False, None
     m2_qty, m2_cost = 0.0, 0.0                     # units held and money spent (avg price = cost / units)
     last_buy_key = None
+    m3_prev_hit = False                            # Method 3: was the exit condition already true on the previous bar?
 
     for row in rows:
         if pd.isna(row['CloudTop']) or pd.isna(row['CloudBottom']):
@@ -230,6 +242,10 @@ def m2_gen(df, profit_target_pct, max_lots, start_date=None, lot_qty=1.0, trace=
                 hit = span_hit(price, row['SenkouA'], row['SenkouB'])
             else:
                 hit = (price - m2_avg) / m2_avg >= profit_target_pct / 100.0 and (method != 2 or m2_lots >= max_lots)
+            if method == 3:                                # exit ONLY on the crossing day (or same day as a lot bought)
+                raw_hit = bool(hit)
+                hit = raw_hit and (bought or not m3_prev_hit)
+                m3_prev_hit = raw_hit
             if hit:
                 trade_id += 1
                 trades.append({
@@ -243,6 +259,7 @@ def m2_gen(df, profit_target_pct, max_lots, start_date=None, lot_qty=1.0, trace=
                 m2_prev_exit = True
                 m2_seg_start = None
                 m2_lots, m2_avg, m2_qty, m2_cost = 0, None, 0.0, 0.0   # exit = flat; fresh trade on the next close above cloud
+                m3_prev_hit = False
         state['lots'] = m2_lots
         if trace is not None:
             trace.append({'Date': date, 'Close': price, 'CloudTop': row['CloudTop'],
@@ -744,7 +761,7 @@ def create_strategies(folder, prefix, exchange, symbols, tfs, capital, sizes, cl
                             + ('' if cdc == 'every' else f' {cdc}')
                             + (f' amt{val:g}' if kind == 'amt' else (' eq' if kind == 'eq' else (f' q{val:g}' if len(sizes) > 1 else '')))
                             + {'below': ' belowcloud', 'inside': ' insidecloud'}.get(ent, '')
-                            + (' method2' if mth == 2 else ''))
+                            + (f' method{mth}' if mth > 1 else ''))
                     path = os.path.join(d, safe(name) + '.json')
                     if os.path.exists(path):
                         skipped.append(name)
@@ -1134,7 +1151,8 @@ def page_builder():
             lbl('Entry method (one file each)')
             methods = [METHOD_OPTIONS[x] for x in checkbox_dropdown('Select method', list(METHOD_OPTIONS), ['Method 1 - exit at any lot count'], 'method')]
             st.caption('Method 1: profit target exits at ANY lot count.  Method 2: profit target is checked only AFTER all Max lots are filled '
-                       '(span / cloud exits still work any time).')
+                       '(span / cloud exits still work any time).  Method 3: scale-in 1 lot per bar, whole position exits ONLY on the crossing day '
+                       '(condition true today, not true on the previous bar; a lot bought today counts as a fresh crossing).')
             c1, c2, c3, c4 = st.columns(4)
             with c1:
                 lbl('Max lots (one file each)')
