@@ -18,6 +18,7 @@ Strategy files are saved in the  strategies/<ClientID>/<folder>/  folder next to
 NOTE: on Streamlit Cloud that folder is wiped when the app reboots - run it on your own PC to keep files.
 """
 import datetime as dt
+import io
 import json
 import os
 import re
@@ -699,24 +700,47 @@ def money(x):
 
 
 # =============================================================== pages
-def checkbox_dropdown(title, options, default, key, fmt=str):
-    """Drop-down with a check box beside every option + Select all. Returns the ticked options."""
+def checkbox_dropdown(title, options, default, key, fmt=str, custom=False):
+    """Drop-down with a check box beside every option + Select all. Returns the ticked options.
+    custom=True adds a small "type a value + ＋" line at the bottom of the list (for quantity / amount)."""
     base = f'cb_{key}'
-    for o in options:
+    extra = st.session_state.setdefault(f'{base}__extra', []) if custom else []
+    opts = list(options) + [x for x in extra if x not in options]
+    if custom:
+        opts = sorted(opts)
+    for o in opts:
         if f'{base}_{o}' not in st.session_state:
             st.session_state[f'{base}_{o}'] = o in default
 
     def _toggle_all():
         v = st.session_state[f'{base}__all']
-        for o in options:
+        for o in opts:
             st.session_state[f'{base}_{o}'] = v
 
-    chosen = [o for o in options if st.session_state[f'{base}_{o}']]
-    st.session_state[f'{base}__all'] = len(chosen) == len(options)
+    def _add():                                                   # runs before the page re-draws
+        for x in str(st.session_state.get(f'{base}__new', '')).split(','):
+            try:
+                v = float(x.strip())
+            except ValueError:
+                continue
+            v = int(v) if v == int(v) else v
+            if v > 0 and v not in options and v not in st.session_state[f'{base}__extra']:
+                st.session_state[f'{base}__extra'].append(v)
+                st.session_state[f'{base}_{v}'] = True            # new value is ticked straight away
+        st.session_state[f'{base}__new'] = ''
+
+    chosen = [o for o in opts if st.session_state[f'{base}_{o}']]
+    st.session_state[f'{base}__all'] = len(chosen) == len(opts)
     with st.popover(f'{title} · {len(chosen)} selected', width='stretch'):
         st.checkbox('Select all', key=f'{base}__all', on_change=_toggle_all)
-        for o in options:
+        for o in opts:
             st.checkbox(fmt(o), key=f'{base}_{o}')
+        if custom:
+            st.divider()
+            c1, c2 = st.columns([4, 1])
+            c1.text_input('Add value', key=f'{base}__new', placeholder='type a value, e.g. 15 (comma for many)',
+                          label_visibility='collapsed')
+            c2.button('＋', key=f'{base}__add', on_click=_add, help='Add this value to the list')
     return chosen
 
 
@@ -759,6 +783,70 @@ def instrument_choices(exchange):
         if best:
             out['Commodity'] = [v[1] for k, v in sorted(best.items())]      # nearest-expiry future of each commodity
     return out
+
+
+NSE_INDEX_CSV = {                                              # niftyindices.com constituent lists (downloaded once a day)
+    'NIFTY 50': 'ind_nifty50list.csv', 'NIFTY NEXT 50': 'ind_niftynext50list.csv', 'NIFTY 100': 'ind_nifty100list.csv',
+    'NIFTY 200': 'ind_nifty200list.csv', 'NIFTY 500': 'ind_nifty500list.csv', 'NIFTY BANK': 'ind_niftybanklist.csv',
+    'NIFTY MIDCAP 50': 'ind_niftymidcap50list.csv', 'NIFTY MIDCAP 100': 'ind_niftymidcap100list.csv',
+    'NIFTY MIDCAP 150': 'ind_niftymidcap150list.csv', 'NIFTY SMALLCAP 50': 'ind_niftysmallcap50list.csv',
+    'NIFTY SMALLCAP 100': 'ind_niftysmallcap100list.csv', 'NIFTY SMALLCAP 250': 'ind_niftysmallcap250list.csv',
+    'NIFTY MIDSMALLCAP 400': 'ind_niftymidsmallcap400list.csv', 'NIFTY IT': 'ind_niftyitlist.csv',
+    'NIFTY AUTO': 'ind_niftyautolist.csv', 'NIFTY FMCG': 'ind_niftyfmcglist.csv', 'NIFTY PHARMA': 'ind_niftypharmalist.csv',
+    'NIFTY METAL': 'ind_niftymetallist.csv', 'NIFTY REALTY': 'ind_niftyrealtylist.csv', 'NIFTY ENERGY': 'ind_niftyenergylist.csv',
+    'NIFTY MEDIA': 'ind_niftymedialist.csv', 'NIFTY PSU BANK': 'ind_niftypsubanklist.csv', 'NIFTY INFRA': 'ind_niftyinfralist.csv',
+    'NIFTY FINANCE': 'ind_niftyfinancelist.csv', 'NIFTY PVT BANK': 'ind_nifty_privatebanklist.csv',
+    'NIFTY COMMODITIES': 'ind_niftycommoditieslist.csv', 'NIFTY CONSUMPTION': 'ind_niftyconsumptionlist.csv',
+}
+MCX_INDEX_PREFIX = {'BULL': ('GOLD', 'SILVER'), 'METL': ('ALUMIN', 'COPPER', 'LEAD', 'NICKEL', 'ZINC'),
+                    'METAL': ('ALUMIN', 'COPPER', 'LEAD', 'NICKEL', 'ZINC'), 'ENRG': ('CRUDEOIL', 'NATURALGAS', 'NATGAS'),
+                    'ENERGY': ('CRUDEOIL', 'NATURALGAS', 'NATGAS')}
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _nse_index_symbols(csv_name):
+    r = requests.get(f'https://www.niftyindices.com/IndexConstituent/{csv_name}', headers={'User-Agent': 'Mozilla/5.0'}, timeout=15)
+    r.raise_for_status()
+    return [str(x).strip() for x in pd.read_csv(io.StringIO(r.text))['Symbol'].dropna()]
+
+
+def index_members(exchange, index_name):
+    """-> (list of tradable symbols that belong to that index, note). Empty list + note when unknown."""
+    try:
+        idx = _token_index()
+        if exchange == 'NSE':
+            key = re.sub(r'\s+', ' ', index_name.upper().replace('SMLCAP', 'SMALLCAP').replace('MIDSML', 'MIDSMALLCAP')
+                         .replace('FIN SERVICE', 'FINANCE')).strip()
+            names = None
+            if key in NSE_INDEX_CSV:
+                try:
+                    names = _nse_index_symbols(NSE_INDEX_CSV[key])
+                except Exception:
+                    names = NIFTY50_STOCKS if key == 'NIFTY 50' else None      # offline fallback
+            if not names:
+                return [], f'{index_name}: stock list not available - use "Or type names"'
+            ok = [x for x in names if ('NSE', x.upper() + '-EQ') in idx]
+            return ok, '' if ok else f'{index_name}: none of its stocks found on NSE'
+        if exchange == 'MCX':
+            rows = [r for r in _scrip_master() if r.get('exch_seg') == 'MCX' and r.get('instrumenttype') == 'FUTCOM']
+            up = index_name.upper()
+            prefixes = next((v for k, v in MCX_INDEX_PREFIX.items() if k in up), None)      # unknown index -> every commodity
+            today, best = now_ist().to_pydatetime(), {}
+            for r in rows:
+                nm = r['name'].upper()
+                if prefixes and not nm.startswith(prefixes):
+                    continue
+                try:
+                    exp = dt.datetime.strptime(r['expiry'], '%d%b%Y')
+                except Exception:
+                    continue
+                if exp.date() >= today.date() and (r['name'] not in best or exp < best[r['name']][0]):
+                    best[r['name']] = (exp, r['symbol'])
+            out = [v[1] for k, v in sorted(best.items())]                  # nearest-expiry future of each commodity
+            return out, '' if out else f'{index_name}: no running futures found'
+    except Exception as e:
+        return [], f'{index_name}: {e}'
+    return [], f'{index_name}: stock list not available - use "Or type names"'
 
 
 def lbl(text):                                                # same label look for EVERY field -> rows line up
@@ -808,24 +896,38 @@ def page_builder():
 
         with st.container(border=True):                       # ---- ENTRY CONDITION
             section_title('Entry condition', 'Ichimoku cloud - method, index, stocks, candle, position size (live: starts from now)')
-            picked = []
-            groups = list(instrument_choices(exchange).items())
-            cols = st.columns(len(groups) + 1)
-            for col, (label, opts) in zip(cols, groups):
-                with col:
-                    lbl(f'{label} ({len(opts)})')
-                    picked += checkbox_dropdown(f'Select {label.lower()}', opts, [], f'sym_{exchange}_{label}')
-            with cols[-1]:
+            idx_opts = instrument_choices(exchange).get('Index', [])
+            cols = st.columns(3)                                  # Index | its stocks | type names
+            with cols[0]:
+                lbl(f'Index ({len(idx_opts)})')
+                sel_idx = checkbox_dropdown('Select index', idx_opts, [], f'idx_{exchange}')
+            members, notes = [], []
+            for ix in sel_idx:                                    # chosen index -> ITS stocks (MCX: its commodity futures)
+                m_, note_ = index_members(exchange, ix)
+                members += [x for x in m_ if x not in members]
+                if note_:
+                    notes.append(note_)
+            with cols[1]:
+                what = 'Commodities' if exchange == 'MCX' else 'Stocks'
+                lbl(f'{what} of the chosen index ({len(members)})')
+                if members:
+                    picked = checkbox_dropdown(f'Select {what.lower()}', members, members, f'stk_{exchange}')
+                else:
+                    picked = []
+                    st.popover('Choose an index first', width='stretch', disabled=True)
+            with cols[2]:
                 lbl('Or type names (comma separated)')
                 typed_txt = st.text_input('Or type names', label_visibility='collapsed',
                                           placeholder='Nifty 50, RELIANCE, GOLDM05DEC25FUT',
                                           help='Index: Nifty 50  |  Stock: RELIANCE (or RELIANCE-EQ)  |  MCX: exact future symbol. '
                                                'Typed names are added to the ticked ones.')
+            if notes:
+                st.caption(' | '.join(notes))
             lbl('Entry method (one file each)')
             methods = [METHOD_OPTIONS[x] for x in checkbox_dropdown('Select method', list(METHOD_OPTIONS), ['Method 1 - exit at any lot count'], 'method')]
             st.caption('Method 1: profit target exits at ANY lot count.  Method 2: profit target is checked only AFTER all Max lots are filled '
                        '(span / cloud exits still work any time).')
-            c1, c2, c3, c4 = st.columns(4)
+            c1, c2, c3 = st.columns(3)
             with c1:
                 lbl('Max lots (one file each)')
                 lots_list = checkbox_dropdown('Select lots', LOTS_OPTIONS, [10], 'lots')
@@ -835,10 +937,7 @@ def page_builder():
             with c3:
                 lbl('Price vs cloud (one file each)')
                 entries = [ENTRY_OPTIONS[x] for x in checkbox_dropdown('Select entry', list(ENTRY_OPTIONS), ['Above cloud'], 'entry')]
-            with c4:
-                lbl('Market close')
-                close_t = st.time_input('Market close', dt.time(23, 30) if exchange == 'MCX' else dt.time(15, 30),
-                                        key=f'close_{exchange}', label_visibility='collapsed')
+            close_t = dt.time(23, 30) if exchange == 'MCX' else dt.time(15, 30)      # fixed by exchange (no input box)
             c = st.columns(3)
             with c[0]:
                 lbl('Position - size each lot by')
@@ -856,20 +955,11 @@ def page_builder():
                 if kind == 'qty':
                     with row[a_]:
                         lbl('Quantity per lot')
-                        vals = [float(q) for q in checkbox_dropdown('Select quantity', QTY_OPTIONS, [1], 'qty')]
-                    with row[b_]:
-                        lbl('Or type quantity')
-                        vals += typed_values(st.text_input('Or type quantity', label_visibility='collapsed',
-                                                           placeholder='3, 15, 40', key='size_txt_qty'))
+                        vals = [float(q) for q in checkbox_dropdown('Select quantity', QTY_OPTIONS, [1], 'qty', custom=True)]
                 else:
                     with row[a_]:
                         lbl('Amount per lot')
-                        vals = [float(q) for q in checkbox_dropdown('Select amount', AMOUNT_OPTIONS, [10000], 'amt')]
-                    with row[b_]:
-                        lbl('Or type amount')
-                        vals += typed_values(st.text_input('Or type amount', label_visibility='collapsed',
-                                                           placeholder='15000, 75000', key='size_txt_amt',
-                                                           help='Money put in every lot (units = amount / price of that lot).'))
+                        vals = [float(q) for q in checkbox_dropdown('Select amount', AMOUNT_OPTIONS, [10000], 'amt', custom=True)]
                 sizes += [(kind, v) for v in dict.fromkeys(vals)]
 
         with st.container(border=True):                       # ---- EXIT CONDITION
