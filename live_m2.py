@@ -1771,7 +1771,7 @@ def page_view(topic, refresh):
 
         if loading:                                                # candles still downloading in the background
             time.sleep(4)
-            st.rerun(scope='fragment')
+            st.rerun()                                             # whole-app rerun is allowed here (scope='fragment' is not on the 1st run)
 
     st.fragment(run_every=int(refresh))(body)()
 
