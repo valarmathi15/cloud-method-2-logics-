@@ -15,7 +15,8 @@ updates every ~1.5 s on the strategy page; BUY / EXIT decisions still use CLOSED
 Run : python -m streamlit run live_m2.py
 Login details (API key, Client ID, MPIN, TOTP secret) are typed on the first screen.
 Strategy files are saved in the  strategies/<ClientID>/<folder>/  folder next to this file.
-NOTE: on Streamlit Cloud that folder is wiped when the app reboots - run it on your own PC to keep files.
+NOTE: on Streamlit Cloud that folder is wiped when the app reboots - use  Account > Backup / Restore  (or run it on your own PC).
+Candles download in BACKGROUND threads, so My Strategies opens at once and shows 'Loading' until each symbol is ready.
 """
 import datetime as dt
 import heapq
@@ -25,6 +26,8 @@ import os
 import re
 import shutil
 import threading
+import zipfile
+from concurrent.futures import ThreadPoolExecutor
 import time
 
 import numpy as np
@@ -519,45 +522,112 @@ def _fetch_range(smart, exchange, token, interval, frm, to):
     return df[['Date', 'Open', 'High', 'Low', 'Close']]
 
 
-def fetch_candles(smart, exchange, symbol, tf, start_date):
+def fetch_candles(smart, exchange, symbol, tf, start_date, token=None):
     """-> raw candles (Date, Open, High, Low, Close), tz-naive IST, oldest first."""
     interval, _, warm_days = TF[tf]
-    token = _instrument_token(exchange, symbol)
+    token = token or _instrument_token(exchange, symbol)
     df = _fetch_range(smart, exchange, token, interval, pd.Timestamp(start_date) - pd.Timedelta(days=warm_days), now_ist())
     if df.empty:
         raise ValueError('no candles returned')
     return df.drop_duplicates('Date', keep='last').sort_values('Date').reset_index(drop=True)
 
 
+class DataLoading(Exception):
+    """candles for this symbol are still being downloaded in the background (NOT an error)."""
+
+
+FAIL_RETRY_SECS = 30     # after a failed download, wait this long before trying again
+
+
 @st.cache_resource
 def _candle_store():
-    return {'lock': threading.Lock(), 'data': {}}
+    return {'lock': threading.Lock(), 'data': {}, 'pending': set(), 'fail': {}, 'smart': {},
+            'login_lock': threading.Lock(), 'pool': ThreadPoolExecutor(max_workers=3, thread_name_prefix='candles')}
 
 
-def load_candles(smart, exchange, symbol, tf, start_day):
-    """History is downloaded ONCE per symbol/timeframe; after that only the newest candles are fetched
-    (1 small request, at most every RECHECK_SECS) -> no more 'exceeding access rate'."""
+def _shared_smart(S, creds, stale=None):
+    """ONE Angel login shared by all background workers (a worker never touches st.session_state)."""
+    cid = creds['client_id']
+    with S['login_lock']:
+        cur = S['smart'].get(cid)
+        if cur is None or (stale is not None and cur is stale):
+            cur = angel_login(creds['client_id'], creds['api_key'], creds['mpin'], creds['totp'])
+            S['smart'][cid] = cur
+        return cur
+
+
+def _with_relogin(S, creds, fn):
+    smart = _shared_smart(S, creds)
+    try:
+        return fn(smart)
+    except Exception as e:
+        if _is_rate_msg(e) or 'no candles' in str(e):
+            raise
+        return fn(_shared_smart(S, creds, stale=smart))           # session expired? log in again once
+
+
+def _bg_full(S, key, token, creds):
+    exchange, symbol, tf, start_day = key
+    try:
+        df = _with_relogin(S, creds, lambda sm: fetch_candles(sm, exchange, symbol, tf, start_day, token))
+        with S['lock']:
+            S['data'][key] = {'df': df, 'checked': time.time(), 'error': None, 'refreshing': False}
+            S['fail'].pop(key, None)
+    except Exception as ex:
+        with S['lock']:
+            S['fail'][key] = (time.time(), str(ex))
+    finally:
+        with S['lock']:
+            S['pending'].discard(key)
+
+
+def _bg_topup(S, key, token, creds):
+    exchange, symbol, tf, _ = key
+    e = S['data'][key]
+    try:
+        interval = TF[tf][0]
+        back = pd.Timedelta(days=5 if interval == 'ONE_DAY' else 2)
+        new = _with_relogin(S, creds, lambda sm: _fetch_range(sm, exchange, token, interval, e['df']['Date'].iloc[-1] - back, now_ist()))
+        with S['lock']:
+            if not new.empty:
+                df = pd.concat([e['df'], new]).drop_duplicates('Date', keep='last').sort_values('Date')
+                e['df'] = df.reset_index(drop=True)
+            e['error'] = None
+    except Exception as ex:                                       # keep showing the last good data, retry next refresh
+        with S['lock']:
+            e['error'] = str(ex)
+    finally:
+        with S['lock']:
+            e['checked'] = time.time()
+            e['refreshing'] = False
+
+
+def load_candles(creds, exchange, symbol, tf, start_day, wait=False):
+    """History is downloaded ONCE per symbol/timeframe - in a BACKGROUND thread, so the page never freezes.
+    wait=False -> raises DataLoading until the download is ready.   wait=True -> waits for it (strategy page).
+    After that only the newest candles are fetched (1 small request, at most every RECHECK_SECS)."""
     S = _candle_store()
     key = (exchange, symbol, tf, start_day)
-    with S['lock']:
-        e = S['data'].get(key)
-        if e is None:
-            e = S['data'][key] = {'df': fetch_candles(smart, exchange, symbol, tf, start_day),
-                                  'checked': time.time(), 'error': None}
-        elif time.time() - e['checked'] >= RECHECK_SECS:
-            try:
-                interval = TF[tf][0]
-                back = pd.Timedelta(days=5 if interval == 'ONE_DAY' else 2)
-                new = _fetch_range(smart, exchange, _instrument_token(exchange, symbol), interval,
-                                   e['df']['Date'].iloc[-1] - back, now_ist())
-                if not new.empty:
-                    df = pd.concat([e['df'], new]).drop_duplicates('Date', keep='last').sort_values('Date')
-                    e['df'] = df.reset_index(drop=True)
-                e['error'] = None
-            except Exception as ex:                         # keep showing the last good data, retry next refresh
-                e['error'] = str(ex)
-            e['checked'] = time.time()
-        return e['df'].copy(), e['checked'], e['error']
+    token = _instrument_token(exchange, symbol)                    # (cached) - resolved here, in the script thread
+    deadline = time.time() + 240
+    while True:
+        with S['lock']:
+            e = S['data'].get(key)
+            if e is not None:
+                if time.time() - e['checked'] >= RECHECK_SECS and not e.get('refreshing'):
+                    e['refreshing'] = True
+                    S['pool'].submit(_bg_topup, S, key, token, creds)
+                return e['df'].copy(), e['checked'], e['error']
+            if key not in S['pending']:
+                fail = S['fail'].get(key)
+                if fail and time.time() - fail[0] < FAIL_RETRY_SECS:
+                    raise ValueError(fail[1])
+                S['fail'].pop(key, None)
+                S['pending'].add(key)
+                S['pool'].submit(_bg_full, S, key, token, creds)
+        if not wait or time.time() > deadline:
+            raise DataLoading('Loading candles ...')
+        time.sleep(0.4)
 
 
 # =============================================================== candle preparation
@@ -697,14 +767,10 @@ def create_strategies(folder, prefix, exchange, symbols, tfs, capital, sizes, cl
 
 # =============================================================== evaluate one saved strategy
 def get_candles(s):
-    """-> (raw candles, time of last data check, error text or None)"""
+    """-> (raw candles, time of last data check, error text or None).  Raises DataLoading while downloading."""
     day = pd.Timestamp(s['start']).normalize().strftime('%Y-%m-%d')
-    try:
-        return load_candles(get_smart(), s['exchange'], s['symbol'], s['tf'], day)
-    except Exception as e:
-        if _is_rate_msg(e):
-            raise
-        return load_candles(relogin(), s['exchange'], s['symbol'], s['tf'], day)   # session expired?
+    return load_candles(st.session_state['creds'], s['exchange'], s['symbol'], s['tf'], day,
+                        wait=bool(st.session_state.get('_wait_candles')))
 
 
 def first_bar_after_start(df, tf, close_t, start):
@@ -794,6 +860,9 @@ def evaluate_group(strategies):
             continue
         tr, stt = [], {'lots': 0}
         items.append({'s': s, 'trace': tr, 'state': stt, 'stopped': bool(s.get('stopped')), 'g': _eval_gen(s, ctxs[-1], tr, stt)})
+    wait_ = next((e for e in out.values() if isinstance(e, DataLoading)), None)
+    if wait_ is not None:                                          # partial data would give wrong 'max open stocks' results
+        return {s['name']: wait_ for s in strategies}
     results = run_group(items, limit)
     for i, it in enumerate(items):
         out[it['s']['name']] = _eval_finish(it['s'], ctxs[i], it['trace'], results[i])
@@ -823,6 +892,15 @@ def evaluate_any(folder, s):
     if isinstance(r, Exception):
         raise r
     return r
+
+
+def evaluate_blocking(folder, s):
+    """strategy page: wait (max 4 min) for the background download instead of showing 'loading'."""
+    st.session_state['_wait_candles'] = True
+    try:
+        return evaluate_any(folder, s)
+    finally:
+        st.session_state['_wait_candles'] = False
 
 
 def money(x):
@@ -1315,7 +1393,7 @@ def page_file(topic, refresh, fol, fname):
             st.write('Close the open position at the last closed price and stop for good')
             if st.button('✔ Yes', key=f'ex_{fname}', type='primary'):
                 try:
-                    ev_ = evaluate_any(fol, s)
+                    ev_ = evaluate_blocking(fol, s)
                 except Exception:
                     ev_ = None
                 exit_strategy(fol, fname, ev_)
@@ -1368,7 +1446,7 @@ def page_file(topic, refresh, fol, fname):
             ev = None
         else:
             try:
-                ev = evaluate_any(fol, s)
+                ev = evaluate_blocking(fol, s)
             except Exception as e:
                 st.error(f'Could not load data: {e}')
                 return
@@ -1468,6 +1546,34 @@ def page_file(topic, refresh, fol, fname):
     st.fragment(run_every=int(refresh))(body)()
 
 
+def backup_zip():
+    buf, base = io.BytesIO(), user_dir()
+    with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as z:
+        if os.path.isdir(base):
+            for root, _, files in os.walk(base):
+                for fn in files:
+                    pth = os.path.join(root, fn)
+                    z.write(pth, os.path.relpath(pth, base))
+    return buf.getvalue()
+
+
+def restore_zip(data):
+    """put back the .json files of a backup zip; files that already exist are kept (their state is newer)."""
+    base, n = os.path.abspath(user_dir()), 0
+    with zipfile.ZipFile(io.BytesIO(data)) as z:
+        for info in z.infolist():
+            if info.is_dir() or not info.filename.endswith('.json'):
+                continue
+            dest = os.path.abspath(os.path.join(base, info.filename))
+            if not dest.startswith(base + os.sep) or os.path.exists(dest):
+                continue
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            with z.open(info) as src_, open(dest, 'wb') as out_:
+                shutil.copyfileobj(src_, out_)
+            n += 1
+    return n
+
+
 def make_folder():
     name = st.session_state.get('new_folder_name', '').strip()
     if name:
@@ -1480,11 +1586,13 @@ def pnl_txt(x, pct=None):
     return f":{col}[{x:,.2f}]" + ('' if pct is None else f" ({pct:+.2f}%)")
 
 
-def row_stats(s, ev, err):
+def row_stats(s, ev, err, loading=False):
     if s.get('stopped'):
         f = s.get('final', {})
         return {'state': 'Stopped', 'sub': f"exited {f.get('at', '')}", 'open_n': 0, 'closed_n': f.get('closed_n', 0),
                 'realized': f.get('realized', 0.0), 'unreal': 0.0}
+    if ev is None and loading:
+        return {'state': 'Loading', 'sub': 'Downloading candles from Angel ...', 'open_n': 0, 'closed_n': 0, 'realized': 0.0, 'unreal': 0.0}
     if ev is None:
         return {'state': 'Error', 'sub': (err or '')[:70], 'open_n': 0, 'closed_n': 0, 'realized': 0.0, 'unreal': 0.0}
     last = ev['last']
@@ -1522,6 +1630,7 @@ def page_view(topic, refresh):
             return
 
         evs, errs, groups = {}, {}, {}
+        loading = set()                                            # files whose candles are still downloading
         for fol in shown:                                          # evaluate (candles are cached, only newest ones refetched)
             for f, s in data[fol]:
                 g = s.get('group')
@@ -1532,6 +1641,8 @@ def page_view(topic, refresh):
                     continue
                 try:
                     evs[(fol, f)] = evaluate(s)
+                except DataLoading:
+                    loading.add((fol, f))
                 except Exception as e:
                     errs[(fol, f)] = str(e)
         for (fol, gid), members in groups.items():
@@ -1540,11 +1651,13 @@ def page_view(topic, refresh):
                 res = evaluate_group([s for _, s in members])
             except Exception as e:
                 for f, s in members:
-                    errs[(fol, f)] = str(e)
+                    (loading.add((fol, f)) if isinstance(e, DataLoading) else errs.__setitem__((fol, f), str(e)))
                 continue
             for f, s in members:
                 r = res.get(s['name'])
-                if isinstance(r, Exception):
+                if isinstance(r, DataLoading):
+                    loading.add((fol, f))
+                elif isinstance(r, Exception):
                     errs[(fol, f)] = str(r)
                 elif not s.get('stopped'):
                     evs[(fol, f)] = r
@@ -1559,7 +1672,8 @@ def page_view(topic, refresh):
             stale = [ev for ev in evs.values() if ev.get('data_err')]
             checks = [ev['checked'] for ev in evs.values() if ev.get('checked')]
             msg = (f"🟢 **LIVE**  |  market {'open' if is_open else 'closed'}  |  refreshed {now:%H:%M:%S} (every {int(refresh)}s)  |  "
-                   f"Angel data checked {ts_ist(max(checks)).strftime('%H:%M:%S') if checks else '-'}  |  {len(evs)} running file(s) OK")
+                   f"Angel data checked {ts_ist(max(checks)).strftime('%H:%M:%S') if checks else '-'}  |  {len(evs)} running file(s) OK"
+                   + (f"  |  ⏳ {len(loading)} loading candles ..." if loading else ''))
             if errs or stale:
                 msg += f"  |  ⚠️ {len(errs)} error(s), {len(stale)} using last good data (Angel rate limit?)"
             status_ph.markdown(msg)
@@ -1575,7 +1689,7 @@ def page_view(topic, refresh):
                             delete_folder(fol)
                             st.rerun()
                     continue
-                stats = {f: row_stats(s, evs.get((fol, f)), errs.get((fol, f))) for f, s in files}
+                stats = {f: row_stats(s, evs.get((fol, f)), errs.get((fol, f)), (fol, f) in loading) for f, s in files}
                 o = sum(x['open_n'] for x in stats.values())
                 cl = sum(x['closed_n'] for x in stats.values())
                 real = sum(x['realized'] for x in stats.values())
@@ -1635,7 +1749,7 @@ def page_view(topic, refresh):
                             r[1].caption('LTP ' + (f"{tk_['ltp']:,.2f}" if tk_ else '...'))
                         except Exception:
                             pass
-                    dot = {'Running': '🟢', 'Paused': '🟡', 'Stopped': '⚫', 'Error': '🔴'}[x['state']]
+                    dot = {'Running': '🟢', 'Paused': '🟡', 'Stopped': '⚫', 'Error': '🔴', 'Loading': '⏳'}[x['state']]
                     r[2].write(f"{dot} {x['state']}")
                     r[2].caption(x['sub'])
                     r[3].markdown(f"Open **{x['open_n']}** · Closed **{x['closed_n']}** · Realized {pnl_txt(x['realized'])}  \n"
@@ -1654,6 +1768,10 @@ def page_view(topic, refresh):
                             delete_strategy(fol, f)
                             st.rerun()
                     st.divider()
+
+        if loading:                                                # candles still downloading in the background
+            time.sleep(4)
+            st.rerun(scope='fragment')
 
     st.fragment(run_every=int(refresh))(body)()
 
@@ -1719,6 +1837,12 @@ def main():
         except Exception:
             pass
         st.number_input('Refresh every (seconds)', 15, 3600, 60, 15, key='refresh_secs')
+        st.caption('Streamlit Cloud reboot aana strategy files azhiyum - backup download panni vechukkonga.')
+        st.download_button('⬇️ Backup my strategies (zip)', backup_zip(), file_name=f"strategies_{st.session_state['creds']['client_id']}.zip", mime='application/zip')
+        up_ = st.file_uploader('Restore from backup zip', type='zip', key='restore_zip')
+        if up_ is not None and st.button('Restore files'):
+            st.success(f'{restore_zip(up_.getvalue())} file(s) restored')
+            st.rerun()
         if st.button('Logout / change details'):
             for k_ in ('creds', 'smart'):
                 st.session_state.pop(k_, None)
