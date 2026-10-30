@@ -1243,31 +1243,6 @@ def page_builder():
                                               placeholder='Nifty 50, RELIANCE, GOLDM05DEC25FUT',
                                               help='Index: Nifty 50  |  Stock: RELIANCE (or RELIANCE-EQ)  |  MCX: exact future symbol. '
                                                    'Typed names are added to the ticked ones.')
-                idx_opts = instrument_choices(exchange).get('Index', [])
-                cols = st.columns(3)                                  # Index | its stocks | type names
-                with cols[0]:
-                    lbl(f'Index ({len(idx_opts)})')
-                    sel_idx = checkbox_dropdown('Select index', idx_opts, [], f'idx_{exchange}')
-                members, notes = [], []
-                for ix in sel_idx:                                    # chosen index -> ITS stocks (MCX: its commodity futures)
-                    m_, note_ = index_members(exchange, ix)
-                    members += [x for x in m_ if x not in members]
-                    if note_:
-                        notes.append(note_)
-                with cols[1]:
-                    what = 'Commodities' if exchange == 'MCX' else 'Stocks'
-                    lbl(f'{what} of the chosen index ({len(members)})')
-                    if members:
-                        picked = checkbox_dropdown(f'Select {what.lower()}', members, members, f'stk_{exchange}')
-                    else:
-                        picked = []
-                        st.popover('Choose an index first', width='stretch', disabled=True)
-                with cols[2]:
-                    lbl('Or type names (comma separated)')
-                    typed_txt = st.text_input('Or type names', label_visibility='collapsed',
-                                              placeholder='Nifty 50, RELIANCE, GOLDM05DEC25FUT',
-                                              help='Index: Nifty 50  |  Stock: RELIANCE (or RELIANCE-EQ)  |  MCX: exact future symbol. '
-                                                   'Typed names are added to the ticked ones.')
             if notes:
                 st.caption(' | '.join(notes))
             lbl('Entry method (one file each)')
