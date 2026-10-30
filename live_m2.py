@@ -78,7 +78,15 @@ CANDLE_OPTIONS = {'Every candle': 'every', 'Daily': 'daily', 'Weekly': 'weekly'}
 
 
 def exit_label(x):
+    if isinstance(x, tuple):                                   # combined exit: ('AND' | 'OR', [items])
+        return f"{x[0]}({' + '.join(exit_label(i) for i in x[1])})"
     return f'{x}%' if isinstance(x, (int, float)) else x
+
+
+def combo_spec(x):
+    """('AND'|'OR', [items]) -> {'logic': 'and'|'or', 'pcts': [..], 'spans': [codes]}"""
+    return {'logic': x[0].lower(), 'pcts': [i for i in x[1] if isinstance(i, (int, float))],
+            'spans': [SPAN_OPTIONS[i] for i in x[1] if i in SPAN_OPTIONS]}
 
 
 def size_text(s):
@@ -138,7 +146,7 @@ SPAN_TEXT = {'A': 'Span A', 'B': 'Span B', 'A&B': 'Span A & B', 'AorB': 'Span A 
              'CloudAbove': 'the cloud top', 'CloudBelow': 'the cloud bottom', 'CloudInside': 'the cloud'}
 
 
-def m2_gen(df, profit_target_pct, max_lots, start_date=None, lot_qty=1.0, trace=None, span=None, candle='every', lot_amount=None, skip=None, entry='above', method=1, state=None):
+def m2_gen(df, profit_target_pct, max_lots, start_date=None, lot_qty=1.0, trace=None, span=None, candle='every', lot_amount=None, skip=None, entry='above', method=1, state=None, combo=None):
     """GENERATOR version of Method 2. Yields ('NEXT', bar_date) before every bar and ('ASK', bar_date) when a FLAT stock wants to
     open a NEW position - the caller answers True / False (portfolio limit). state['lots'] always shows the lots held.
     run_m2() below drives it for one stock; run_group() drives many stocks in time order.
@@ -165,6 +173,7 @@ def m2_gen(df, profit_target_pct, max_lots, start_date=None, lot_qty=1.0, trace=
         full = full[full['Date'] >= pd.Timestamp(start_date)].reset_index(drop=True)
     rows = full.to_dict('records')
     span_hit = SPAN_RULES.get(span)
+    combo_logic = (combo or {}).get('logic')                # 'and' = ALL chosen exits true on the same bar, 'or' = ANY one
 
     def pkey(d):
         if candle == 'daily':
@@ -180,6 +189,10 @@ def m2_gen(df, profit_target_pct, max_lots, start_date=None, lot_qty=1.0, trace=
     if method == 3:
         exit_reason = (exit_reason.replace('(Method 2)', '(Method 3 - crossing day)') if span_hit
                        else f'Profit target {profit_target_pct}% crossed (Method 3 - crossing day)')
+    if combo:
+        _parts = [f'{p}%' for p in combo['pcts']] + [SPAN_TEXT[c] for c in combo['spans']]
+        exit_reason = (f"Combined exit {combo_logic.upper()}: " + f" {combo_logic.upper()} ".join(_parts)
+                       + (' (Method 3 - crossing day)' if method == 3 else f' (Method {method})'))
     trades = []
     trade_id = 0
     if state is None:
@@ -238,7 +251,11 @@ def m2_gen(df, profit_target_pct, max_lots, start_date=None, lot_qty=1.0, trace=
         if m2_seg_start is None and m2_lots > 0:
             m2_seg_start = date
         if m2_lots > 0 and m2_avg:
-            if span_hit:
+            if combo:
+                conds = [(price - m2_avg) / m2_avg >= pc / 100.0 and (method != 2 or m2_lots >= max_lots) for pc in combo['pcts']]
+                conds += [SPAN_RULES[c](price, row['SenkouA'], row['SenkouB']) for c in combo['spans']]
+                hit = bool(conds) and (all(conds) if combo_logic == 'and' else any(conds))
+            elif span_hit:
                 hit = span_hit(price, row['SenkouA'], row['SenkouB'])
             else:
                 hit = (price - m2_avg) / m2_avg >= profit_target_pct / 100.0 and (method != 2 or m2_lots >= max_lots)
@@ -766,14 +783,16 @@ def create_strategies(folder, prefix, exchange, symbols, tfs, capital, sizes, cl
                     if os.path.exists(path):
                         skipped.append(name)
                         continue
-                    is_span = ex in SPAN_OPTIONS
+                    is_combo = isinstance(ex, tuple)
+                    is_span = (not is_combo) and ex in SPAN_OPTIONS
                     s = {'name': name, 'folder': folder, 'mode': 'paper', 'exchange': exchange, 'symbol': sym,
-                         'tf': tf, 'profit': None if is_span else ex, 'span': SPAN_OPTIONS.get(ex),
+                         'tf': tf, 'profit': None if (is_span or is_combo) else ex, 'span': None if is_combo else SPAN_OPTIONS.get(ex),
+                         'combo': combo_spec(ex) if is_combo else None,
                          'exit_label': exit_label(ex), 'candle': cdc, 'lots': lots, 'capital': capital,
                          'qty': val if kind == 'qty' else 1.0, 'amount': amt if kind in ('amt', 'eq') else None,
                          'sizing': 'equal' if kind == 'eq' else ('amount' if kind == 'amt' else 'qty'), 'entry': ent, 'method': mth,
                          'close': close, 'start': start,
-                         'group': ({'id': f"{start}|{tf}|{lots}|{kind}{val}|{ex}|{ent}|{mth}|{cdc}", 'limit': int(max_open), 'rank': rank}
+                         'group': ({'id': f"{start}|{tf}|{lots}|{kind}{val}|{exit_label(ex)}|{ent}|{mth}|{cdc}", 'limit': int(max_open), 'rank': rank}
                                    if max_open else None),
                          'created': now_ist().to_pydatetime().strftime('%Y-%m-%d %H:%M')}
                     with open(path, 'w', encoding='utf-8') as f:
@@ -830,7 +849,7 @@ def _eval_prepare(s):
 def _eval_gen(s, ctx, trace, state):
     return m2_gen(ctx['df'], s.get('profit') or 0.0, int(s['lots']), start_date=ctx['eff_start'], lot_qty=s['qty'], trace=trace,
                   span=s.get('span'), candle=s.get('candle', 'every'), lot_amount=s.get('amount'), skip=ctx['skip'],
-                  entry=s.get('entry', 'above'), method=int(s.get('method', 1)), state=state)
+                  entry=s.get('entry', 'above'), method=int(s.get('method', 1)), state=state, combo=s.get('combo'))
 
 
 def _eval_finish(s, ctx, trace, trades):
@@ -860,7 +879,7 @@ def evaluate(s):
     trace, st_ = [], {'lots': 0}
     trades = run_m2(ctx['df'], s.get('profit') or 0.0, int(s['lots']), start_date=ctx['eff_start'], lot_qty=s['qty'], trace=trace,
                     span=s.get('span'), candle=s.get('candle', 'every'), lot_amount=s.get('amount'), skip=ctx['skip'],
-                    entry=s.get('entry', 'above'), method=int(s.get('method', 1)))
+                    entry=s.get('entry', 'above'), method=int(s.get('method', 1)), combo=s.get('combo'))
     return _eval_finish(s, ctx, trace, trades)
 
 
@@ -1035,6 +1054,44 @@ def _nse_index_symbols(csv_name):
     return [str(x).strip() for x in pd.read_csv(io.StringIO(r.text))['Symbol'].dropna()]
 
 
+MCX_SEGMENTS = {                                               # MCX segment -> commodity-name prefixes (names come from Angel's instrument list)
+    'Bullion': ('GOLD', 'SILVER'),
+    'Energy': ('CRUDEOIL', 'NATURALGAS', 'NATGAS'),
+    'Base metals': ('ALUMIN', 'COPPER', 'LEAD', 'NICKEL', 'ZINC'),
+}
+MCX_NAMES = {'GOLD': 'Gold', 'GOLDM': 'Gold Mini', 'GOLDGUINEA': 'Gold Guinea', 'GOLDPETAL': 'Gold Petal',
+             'SILVER': 'Silver', 'SILVERM': 'Silver Mini', 'SILVERMIC': 'Silver Micro',
+             'CRUDEOIL': 'Crude Oil', 'CRUDEOILM': 'Crude Oil Mini', 'NATURALGAS': 'Natural Gas', 'NATGASMINI': 'Natural Gas Mini',
+             'ALUMINIUM': 'Aluminium', 'ALUMINI': 'Aluminium Mini', 'COPPER': 'Copper', 'COPPERM': 'Copper Mini',
+             'LEAD': 'Lead', 'LEADMINI': 'Lead Mini', 'NICKEL': 'Nickel', 'NICKELM': 'Nickel Mini',
+             'ZINC': 'Zinc', 'ZINCMINI': 'Zinc Mini'}
+
+
+def mcx_name(n):
+    return MCX_NAMES.get(n, n.title())
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def mcx_catalog():
+    """-> {segment: {commodity name: [(expiry date, symbol), ...] sorted by expiry}}  (only running futures, from Angel's instrument list)."""
+    today = now_ist().to_pydatetime().date()
+    out = {}
+    for r in _scrip_master():
+        if r.get('exch_seg') != 'MCX' or r.get('instrumenttype') != 'FUTCOM':
+            continue
+        try:
+            exp = dt.datetime.strptime(r['expiry'], '%d%b%Y').date()
+        except Exception:
+            continue
+        if exp < today:
+            continue
+        nm = str(r['name']).upper()
+        seg = next((k for k, v in MCX_SEGMENTS.items() if nm.startswith(v)), None)
+        if seg:
+            out.setdefault(seg, {}).setdefault(nm, []).append((exp, r['symbol']))
+    return {s: {n: sorted(set(v)) for n, v in sorted(d.items())} for s, d in out.items()}
+
+
 def index_members(exchange, index_name):
     """-> (list of tradable symbols that belong to that index, note). Empty list + note when unknown."""
     try:
@@ -1121,31 +1178,96 @@ def page_builder():
 
         with st.container(border=True):                       # ---- ENTRY CONDITION
             section_title('Entry condition', 'Ichimoku cloud - method, index, stocks, candle, position size (live: starts from now)')
-            idx_opts = instrument_choices(exchange).get('Index', [])
-            cols = st.columns(3)                                  # Index | its stocks | type names
-            with cols[0]:
-                lbl(f'Index ({len(idx_opts)})')
-                sel_idx = checkbox_dropdown('Select index', idx_opts, [], f'idx_{exchange}')
-            members, notes = [], []
-            for ix in sel_idx:                                    # chosen index -> ITS stocks (MCX: its commodity futures)
-                m_, note_ = index_members(exchange, ix)
-                members += [x for x in m_ if x not in members]
-                if note_:
-                    notes.append(note_)
-            with cols[1]:
-                what = 'Commodities' if exchange == 'MCX' else 'Stocks'
-                lbl(f'{what} of the chosen index ({len(members)})')
-                if members:
-                    picked = checkbox_dropdown(f'Select {what.lower()}', members, members, f'stk_{exchange}')
-                else:
-                    picked = []
-                    st.popover('Choose an index first', width='stretch', disabled=True)
-            with cols[2]:
-                lbl('Or type names (comma separated)')
-                typed_txt = st.text_input('Or type names', label_visibility='collapsed',
-                                          placeholder='Nifty 50, RELIANCE, GOLDM05DEC25FUT',
-                                          help='Index: Nifty 50  |  Stock: RELIANCE (or RELIANCE-EQ)  |  MCX: exact future symbol. '
-                                               'Typed names are added to the ticked ones.')
+            if exchange == 'MCX':                                 # Segment -> Commodity -> Contracts
+                try:
+                    cat = mcx_catalog()
+                except Exception as e:
+                    cat = {}
+                    st.error(f'MCX instrument list not available: {e}')
+                cols = st.columns(4)
+                notes, members, sel_idx = [], [], []
+                with cols[0]:
+                    lbl(f'Segment ({len(cat)})')
+                    segs = checkbox_dropdown('Select segment', list(cat), [], 'mcx_seg')
+                coms = [n for s_ in segs for n in cat.get(s_, {})]
+                with cols[1]:
+                    lbl(f'Commodity ({len(coms)})')
+                    if coms:
+                        pick_com = checkbox_dropdown('Select commodity', coms, [], 'mcx_com', fmt=mcx_name)
+                    else:
+                        pick_com = []
+                        st.popover('Choose a segment first', width='stretch', disabled=True)
+                exp_of, contracts, nearest = {}, [], []
+                for s_ in segs:
+                    for n in pick_com:
+                        for i_, (e_, sym_) in enumerate(cat.get(s_, {}).get(n, [])):
+                            exp_of[sym_] = e_
+                            contracts.append(sym_)
+                            if i_ == 0:
+                                nearest.append(sym_)                  # default tick = nearest expiry of each commodity
+                with cols[2]:
+                    lbl(f'Contracts ({len(contracts)})')
+                    if contracts:
+                        picked = checkbox_dropdown('Select contracts', contracts, nearest, 'mcx_con',
+                                                   fmt=lambda x: f'{x}  ({exp_of[x]:%d %b %Y})')
+                    else:
+                        picked = []
+                        st.popover('Choose a commodity first', width='stretch', disabled=True)
+                with cols[3]:
+                    lbl('Or type names (comma separated)')
+                    typed_txt = st.text_input('Or type names', label_visibility='collapsed', placeholder='GOLDM05DEC25FUT',
+                                              help='MCX: exact future symbol. Typed names are added to the ticked ones.')
+            else:
+                idx_opts = instrument_choices(exchange).get('Index', [])
+                cols = st.columns(3)                                  # Index | its stocks | type names
+                with cols[0]:
+                    lbl(f'Index ({len(idx_opts)})')
+                    sel_idx = checkbox_dropdown('Select index', idx_opts, [], f'idx_{exchange}')
+                members, notes = [], []
+                for ix in sel_idx:                                    # chosen index -> ITS stocks (MCX: its commodity futures)
+                    m_, note_ = index_members(exchange, ix)
+                    members += [x for x in m_ if x not in members]
+                    if note_:
+                        notes.append(note_)
+                with cols[1]:
+                    what = 'Commodities' if exchange == 'MCX' else 'Stocks'
+                    lbl(f'{what} of the chosen index ({len(members)})')
+                    if members:
+                        picked = checkbox_dropdown(f'Select {what.lower()}', members, members, f'stk_{exchange}')
+                    else:
+                        picked = []
+                        st.popover('Choose an index first', width='stretch', disabled=True)
+                with cols[2]:
+                    lbl('Or type names (comma separated)')
+                    typed_txt = st.text_input('Or type names', label_visibility='collapsed',
+                                              placeholder='Nifty 50, RELIANCE, GOLDM05DEC25FUT',
+                                              help='Index: Nifty 50  |  Stock: RELIANCE (or RELIANCE-EQ)  |  MCX: exact future symbol. '
+                                                   'Typed names are added to the ticked ones.')
+                idx_opts = instrument_choices(exchange).get('Index', [])
+                cols = st.columns(3)                                  # Index | its stocks | type names
+                with cols[0]:
+                    lbl(f'Index ({len(idx_opts)})')
+                    sel_idx = checkbox_dropdown('Select index', idx_opts, [], f'idx_{exchange}')
+                members, notes = [], []
+                for ix in sel_idx:                                    # chosen index -> ITS stocks (MCX: its commodity futures)
+                    m_, note_ = index_members(exchange, ix)
+                    members += [x for x in m_ if x not in members]
+                    if note_:
+                        notes.append(note_)
+                with cols[1]:
+                    what = 'Commodities' if exchange == 'MCX' else 'Stocks'
+                    lbl(f'{what} of the chosen index ({len(members)})')
+                    if members:
+                        picked = checkbox_dropdown(f'Select {what.lower()}', members, members, f'stk_{exchange}')
+                    else:
+                        picked = []
+                        st.popover('Choose an index first', width='stretch', disabled=True)
+                with cols[2]:
+                    lbl('Or type names (comma separated)')
+                    typed_txt = st.text_input('Or type names', label_visibility='collapsed',
+                                              placeholder='Nifty 50, RELIANCE, GOLDM05DEC25FUT',
+                                              help='Index: Nifty 50  |  Stock: RELIANCE (or RELIANCE-EQ)  |  MCX: exact future symbol. '
+                                                   'Typed names are added to the ticked ones.')
             if notes:
                 st.caption(' | '.join(notes))
             lbl('Entry method (one file each)')
@@ -1210,7 +1332,15 @@ def page_builder():
             with c[2]:
                 lbl('Cloud exit (one file each)')
                 cloud_exits = checkbox_dropdown('Select cloud exit', list(CLOUD_EXIT), [], 'exits_cloud')
-            targets = pct_exits + span_exits + cloud_exits
+            picked_exits = pct_exits + span_exits + cloud_exits
+            lbl('How to use the selected exits')
+            combine = st.radio('Combine', ['One file each', 'AND  (all selected exits must hit)', 'OR  (any one selected exit hits)'],
+                               horizontal=True, label_visibility='collapsed', key='exit_combine')
+            if combine.startswith('One file') or len(picked_exits) < 2:
+                targets = picked_exits
+            else:
+                targets = [('AND' if combine.startswith('AND') else 'OR', picked_exits)]      # ONE file with a combined exit
+                st.caption(f'1 file with exit  {exit_label(targets[0])}')
 
         start = now_ist().strftime('%Y-%m-%d %H:%M')          # live only: always start from NOW (no past backfill)
         symbols, seen = [], set()
@@ -1426,8 +1556,12 @@ def page_file(topic, refresh, fol, fname):
             e1, e2, e3 = st.columns(3)
             ex_opts = EXIT_OPTIONS
             cur_ex = s.get('span') and next(k for k, v in SPAN_OPTIONS.items() if v == s['span']) or s.get('profit')
-            new_ex = e1.selectbox('Exit', ex_opts, index=ex_opts.index(cur_ex) if cur_ex in ex_opts else 0,
-                                  format_func=exit_label, key=f'ed_ex_{fname}')
+            if s.get('combo'):
+                e1.caption(f"Exit: {s.get('exit_label')}  (combined exit - create a new file to change it)")
+                new_ex = None
+            else:
+                new_ex = e1.selectbox('Exit', ex_opts, index=ex_opts.index(cur_ex) if cur_ex in ex_opts else 0,
+                                      format_func=exit_label, key=f'ed_ex_{fname}')
             new_lots = e2.number_input('Max lots', 1, 1000, int(s['lots']), key=f'ed_lots_{fname}')
             cds = list(CANDLE_OPTIONS)
             cur_cd = next((k for k, v in CANDLE_OPTIONS.items() if v == s.get('candle', 'every')), cds[0])
@@ -1444,11 +1578,12 @@ def page_file(topic, refresh, fol, fname):
                 s['lots'], s['capital'], s['candle'] = int(new_lots), new_cap, CANDLE_OPTIONS[new_cd]
                 s['entry'] = ENTRY_OPTIONS[new_entry]
                 s['method'] = METHOD_OPTIONS[new_method]
-                s['profit'] = None if new_ex in SPAN_OPTIONS else new_ex
-                s['span'] = SPAN_OPTIONS.get(new_ex)
-                s['exit_label'] = exit_label(new_ex)
+                if new_ex is not None:
+                    s['profit'] = None if new_ex in SPAN_OPTIONS else new_ex
+                    s['span'] = SPAN_OPTIONS.get(new_ex)
+                    s['exit_label'] = exit_label(new_ex)
                 s['qty'], s['amount'] = (val, None) if by == 'Quantity' else (1.0, val)
-                log_event(s, f"Settings changed: exit {exit_label(new_ex)}, lots {new_lots}, {by.lower()} {val:g}, buy {new_cd}")
+                log_event(s, f"Settings changed: exit {s.get('exit_label')}, lots {new_lots}, {by.lower()} {val:g}, buy {new_cd}")
                 save_strategy(fol, fname, s)
                 st.rerun()
 
