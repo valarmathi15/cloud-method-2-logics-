@@ -1,5 +1,5 @@
 """
-live_m2.py  -  LIVE PAPER TRADING : Method 1 / 2 / 3 (Cloud Scale-In, Google-sheet logic)   [single file]
+live_m2.py  -  LIVE PAPER TRADING : Method 2 (Cloud Scale-In, Google-sheet logic)   [single file, PAPER ONLY - no real orders]
 =====================================================================================
 BUILDER   : pick folder, exchange, symbols, candle timeframe, capital, qty, Max lots (many) and
             Target % (many)  ->  press Start  ->  ONE FILE is saved for every symbol x lots x target
@@ -12,7 +12,7 @@ so every time you open / refresh, the state is rebuilt from Angel One candles (c
 No background process is needed for the numbers. LIVE PRICE (LTP) comes from the Angel One WebSocket feed and
 updates every ~1.5 s on the strategy page; BUY / EXIT decisions still use CLOSED candles only.
 
-Run : python -m streamlit run live_m2.py
+Run : python -m streamlit run live_m2.py                 (PAPER trading only - this file never sends an order to the broker)
 Login details (API key, Client ID, MPIN, TOTP secret) are typed on the first screen.
 Strategy files are saved in the  strategies/<ClientID>/<folder>/  folder next to this file.
 NOTE: on Streamlit Cloud that folder is wiped when the app reboots - use  Account > Backup / Restore  (or run it on your own PC).
@@ -22,18 +22,24 @@ import datetime as dt
 import heapq
 import io
 import json
+import logging
 import os
 import re
 import shutil
+import sys
 import threading
+import time
+import traceback
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
-import time
 
 import numpy as np
 import pandas as pd
 import requests
+os.environ.setdefault('STREAMLIT_LOGGER_LEVEL', 'error')
 import streamlit as st
+
+logging.getLogger('streamlit').setLevel(logging.ERROR)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 STRAT_ROOT = os.path.join(HERE, 'strategies')
@@ -67,11 +73,14 @@ LOTS_OPTIONS = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
 TARGET_OPTIONS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
 SPAN_ONLY = {'SPAN A': 'A', 'SPAN B': 'B', 'SPAN A & B': 'A&B', 'SPAN A OR B': 'AorB'}
 CLOUD_EXIT = {'Above cloud': 'CloudAbove', 'Inside cloud': 'CloudInside', 'Below cloud': 'CloudBelow'}
-SPAN_OPTIONS = {**SPAN_ONLY, **CLOUD_EXIT}                      # every non-% exit (stored in the file as `span`)
+SPAN_ABOVE = {f'{k} (above)': v + '_up' for k, v in SPAN_ONLY.items()}      # same spans, exit when price closes ABOVE them
+SPAN_DIRECTION = ['Below span', 'Above span']                     # drop-down: exit when the Close is below / above the chosen span(s)
+SPAN_OPTIONS = {**SPAN_ONLY, **SPAN_ABOVE, **CLOUD_EXIT}                      # every non-% exit (stored in the file as `span`)
 EXIT_OPTIONS = TARGET_OPTIONS + list(SPAN_OPTIONS)               # profit target % + span exits + cloud exits
 ENTRY_OPTIONS = {'Above cloud': 'above', 'Inside cloud': 'inside', 'Below cloud': 'below'}
 METHOD_OPTIONS = {'Method 1 - exit at any lot count': 1, 'Method 2 - exit only after Max lots filled': 2,
-                  'Method 3 - exit only on the CROSSING day': 3}
+                  'Method 3 - exit below cloud, only in profit': 3}
+M3_EXIT = 'Below cloud (in profit)'                              # the fixed exit of Method 3 files (no profit target / span)
 AMOUNT_OPTIONS = [1000, 5000, 10000, 25000, 50000, 100000, 200000, 500000]
 QTY_OPTIONS = [1, 2, 5, 10, 25, 50, 75, 100, 150, 200, 500, 1000]
 CANDLE_OPTIONS = {'Every candle': 'every', 'Daily': 'daily', 'Weekly': 'weekly'}
@@ -138,12 +147,23 @@ SPAN_RULES = {                       # exit rule for the "Span" options (price =
     'B':    lambda p, a, b: p < b,
     'A&B':  lambda p, a, b: p < a and p < b,      # below BOTH spans  (= below the cloud bottom)
     'AorB': lambda p, a, b: p < a or p < b,       # below EITHER span (= below the cloud top)
+    'A_up':    lambda p, a, b: p > a,
+    'B_up':    lambda p, a, b: p > b,
+    'A&B_up':  lambda p, a, b: p > a and p > b,   # above BOTH spans  (= above the cloud top)
+    'AorB_up': lambda p, a, b: p > a or p > b,    # above EITHER span (= above the cloud bottom)
     'CloudAbove': lambda p, a, b: p > max(a, b),  # closed ABOVE the cloud top
     'CloudBelow': lambda p, a, b: p < min(a, b),  # closed BELOW the cloud bottom
     'CloudInside': lambda p, a, b: min(a, b) <= p <= max(a, b),   # closed INSIDE the cloud
 }
 SPAN_TEXT = {'A': 'Span A', 'B': 'Span B', 'A&B': 'Span A & B', 'AorB': 'Span A or B',
              'CloudAbove': 'the cloud top', 'CloudBelow': 'the cloud bottom', 'CloudInside': 'the cloud'}
+
+
+def span_phrase(c):
+    """'A' -> 'below Span A',  'A&B_up' -> 'above Span A & B',  'CloudInside' -> 'inside the cloud' ..."""
+    if c in ('CloudAbove', 'CloudBelow', 'CloudInside'):
+        return {'CloudAbove': 'above', 'CloudBelow': 'below', 'CloudInside': 'inside'}[c] + ' ' + SPAN_TEXT[c]
+    return ('above ' + SPAN_TEXT[c[:-3]]) if c.endswith('_up') else ('below ' + SPAN_TEXT[c])
 
 
 def m2_gen(df, profit_target_pct, max_lots, start_date=None, lot_qty=1.0, trace=None, span=None, candle='every', lot_amount=None, skip=None, entry='above', method=1, state=None, combo=None):
@@ -155,14 +175,7 @@ def m2_gen(df, profit_target_pct, max_lots, start_date=None, lot_qty=1.0, trace=
              (whole position closed; span exits go flat, no repeat exits).
     lot_amount : None = every lot buys `lot_qty` units;  number = every lot invests this AMOUNT (units = amount / lot price).
     method : 1 = profit target can exit at ANY lot count;  2 = profit target is checked ONLY once all Max lots are filled
-             (span / cloud exits stay active at any lot count);
-             3 = SCALE-IN + CROSSING-DAY EXIT (Google-sheet 'Assumptions / Logic'):
-                 - add 1 lot per bar while the entry condition holds, until Max lots (no profit gate on lots)
-                 - the whole position exits ONLY on the CROSSING day: exit condition true today AND NOT true on the previous bar
-                   (so a condition that was already true yesterday never fires late)
-                 - same-day rule: a lot bought on THIS bar counts as a fresh crossing -> if it brings the exit condition
-                   (e.g. profit % to target) true the same day, the exit fires the SAME day
-                 - after an exit the position is flat; a fresh trade starts the next time price closes above the cloud again
+             (span / cloud exits stay active at any lot count).
     entry  : 'above' = buy while Close is ABOVE the cloud top;  'below' = BELOW the cloud bottom;  'inside' = INSIDE the cloud.
     skip   : list of (from, to) timestamps - bars inside are ignored (strategy was paused; no buy / exit then).
     candle : 'every' = buy 1 lot on every candle above the cloud;  'daily' = at most 1 lot per day;
@@ -173,7 +186,7 @@ def m2_gen(df, profit_target_pct, max_lots, start_date=None, lot_qty=1.0, trace=
         full = full[full['Date'] >= pd.Timestamp(start_date)].reset_index(drop=True)
     rows = full.to_dict('records')
     span_hit = SPAN_RULES.get(span)
-    combo_logic = (combo or {}).get('logic')                # 'and' = ALL chosen exits true on the same bar, 'or' = ANY one
+    combo_logic = (combo or {}).get('logic')                # 'and' = ALL chosen exits must be true on the same bar, 'or' = ANY one
 
     def pkey(d):
         if candle == 'daily':
@@ -183,16 +196,15 @@ def m2_gen(df, profit_target_pct, max_lots, start_date=None, lot_qty=1.0, trace=
             return (y, w)
         return None
 
-    exit_reason = (({'CloudAbove': 'Closed above the cloud (Method 2)', 'CloudInside': 'Closed inside the cloud (Method 2)'}.get(span) or f'Closed below {SPAN_TEXT[span]} (Method 2)') if span_hit
-                   else (f'Profit target {profit_target_pct}% hit after all {max_lots} lots filled (Method 2)' if method == 2
-                         else f'Profit target {profit_target_pct}% hit (Method 1 - sheet logic)'))
     if method == 3:
-        exit_reason = (exit_reason.replace('(Method 2)', '(Method 3 - crossing day)') if span_hit
-                       else f'Profit target {profit_target_pct}% crossed (Method 3 - crossing day)')
-    if combo:
-        _parts = [f'{p}%' for p in combo['pcts']] + [SPAN_TEXT[c] for c in combo['spans']]
-        exit_reason = (f"Combined exit {combo_logic.upper()}: " + f" {combo_logic.upper()} ".join(_parts)
-                       + (' (Method 3 - crossing day)' if method == 3 else f' (Method {method})'))
+        exit_reason = 'Closed below the cloud while in profit (Method 3)'
+    elif combo:
+        _parts = [f'{p}%' for p in combo['pcts']] + [f'Close {span_phrase(c)}' for c in combo['spans']]
+        exit_reason = f"Combined exit {combo_logic.upper()}: " + f" {combo_logic.upper()} ".join(_parts) + f" (Method {method})"
+    else:
+        exit_reason = (({'CloudAbove': 'Closed above the cloud (Method 2)', 'CloudInside': 'Closed inside the cloud (Method 2)'}.get(span) or f'Closed {span_phrase(span)} (Method 2)') if span_hit
+                       else (f'Profit target {profit_target_pct}% hit after all {max_lots} lots filled (Method 2)' if method == 2
+                             else f'Profit target {profit_target_pct}% hit (Method 1 - sheet logic)'))
     trades = []
     trade_id = 0
     if state is None:
@@ -201,7 +213,6 @@ def m2_gen(df, profit_target_pct, max_lots, start_date=None, lot_qty=1.0, trace=
     m2_first, m2_lots, m2_avg, m2_prev_exit, m2_seg_start = True, 0, None, False, None
     m2_qty, m2_cost = 0.0, 0.0                     # units held and money spent (avg price = cost / units)
     last_buy_key = None
-    m3_prev_hit = False                            # Method 3: was the exit condition already true on the previous bar?
 
     for row in rows:
         if pd.isna(row['CloudTop']) or pd.isna(row['CloudBottom']):
@@ -246,12 +257,14 @@ def m2_gen(df, profit_target_pct, max_lots, start_date=None, lot_qty=1.0, trace=
                 m2_qty, m2_cost = q, q * price
             else:
                 m2_qty, m2_cost = m2_qty + q, m2_cost + q * price
-            m2_avg = m2_cost / m2_qty
+            m2_avg = (m2_cost / m2_qty) if m2_qty else price      # amount below 1 lot -> 0 units (no divide by zero)
         m2_prev_exit = False
         if m2_seg_start is None and m2_lots > 0:
             m2_seg_start = date
         if m2_lots > 0 and m2_avg:
-            if combo:
+            if method == 3:                                  # Method 3: Close BELOW the cloud AND position in profit -> exit (any lot count)
+                hit = bool(price < row['CloudBottom'] and price > m2_avg)
+            elif combo:
                 conds = [(price - m2_avg) / m2_avg >= pc / 100.0 and (method != 2 or m2_lots >= max_lots) for pc in combo['pcts']]
                 conds += [SPAN_RULES[c](price, row['SenkouA'], row['SenkouB']) for c in combo['spans']]
                 hit = bool(conds) and (all(conds) if combo_logic == 'and' else any(conds))
@@ -259,10 +272,6 @@ def m2_gen(df, profit_target_pct, max_lots, start_date=None, lot_qty=1.0, trace=
                 hit = span_hit(price, row['SenkouA'], row['SenkouB'])
             else:
                 hit = (price - m2_avg) / m2_avg >= profit_target_pct / 100.0 and (method != 2 or m2_lots >= max_lots)
-            if method == 3:                                # exit ONLY on the crossing day (or same day as a lot bought)
-                raw_hit = bool(hit)
-                hit = raw_hit and (bought or not m3_prev_hit)
-                m3_prev_hit = raw_hit
             if hit:
                 trade_id += 1
                 trades.append({
@@ -276,7 +285,6 @@ def m2_gen(df, profit_target_pct, max_lots, start_date=None, lot_qty=1.0, trace=
                 m2_prev_exit = True
                 m2_seg_start = None
                 m2_lots, m2_avg, m2_qty, m2_cost = 0, None, 0.0, 0.0   # exit = flat; fresh trade on the next close above cloud
-                m3_prev_hit = False
         state['lots'] = m2_lots
         if trace is not None:
             trace.append({'Date': date, 'Close': price, 'CloudTop': row['CloudTop'],
@@ -360,17 +368,25 @@ def _scrip_master():
 def _token_index():
     idx = {}
     for r in _scrip_master():
-        idx.setdefault((r['exch_seg'], r['symbol'].upper()), r['token'])
+        idx.setdefault((r['exch_seg'], r['symbol'].upper()), r)
     return idx
 
 
-def _instrument_token(exchange, symbol):
+def _instrument_info(exchange, symbol):
+    """token + exact trading symbol + exchange lot size of an instrument."""
     sym = symbol.strip().upper()
     idx = _token_index()
     for key in (sym, sym + '-EQ'):                                # exact match first
-        if (exchange, key) in idx:
-            return idx[(exchange, key)]
+        r = idx.get((exchange, key))
+        if r:
+            return {'token': r['token'], 'tradingsymbol': r['symbol'], 'lotsize': max(1, int(float(r.get('lotsize') or 1)))}
     raise ValueError(f'{symbol} not found on {exchange}  (equity: SBIN-EQ / index: Nifty 50 / MCX: GOLDM05DEC25FUT)')
+
+
+def _instrument_token(exchange, symbol):
+    return _instrument_info(exchange, symbol)['token']
+
+
 
 
 def _instrument_token_old(exchange, symbol):
@@ -730,8 +746,20 @@ def safe(s):
     return re.sub(r'[^A-Za-z0-9 _.%\-]', '_', str(s)).strip() or 'x'
 
 
+def client_id():
+    return st.session_state['creds']['client_id']
+
+
 def user_dir():
-    return os.path.join(STRAT_ROOT, safe(st.session_state['creds']['client_id']))
+    return os.path.join(STRAT_ROOT, safe(client_id()))
+
+
+def read_json(path, default=None):
+    try:
+        with open(path, encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        return default
 
 
 def list_folders():
@@ -768,9 +796,17 @@ def create_strategies(folder, prefix, exchange, symbols, tfs, capital, sizes, cl
       for tf in tfs:
         for lots in lots_list:
           for kind, val in sizes:
-            for ex in exits:
+            for ex_i, ex0 in enumerate(exits):
               for ent in entries:
                for mth in methods:
+                if mth == 3:                                               # Method 3 has its own fixed exit -> ONE file, not one per exit
+                    if ex_i != 0:
+                        continue
+                    ex = M3_EXIT
+                elif ex0 == M3_EXIT:
+                    continue
+                else:
+                    ex = ex0
                 for cd in candles:
                     cdc = CANDLE_OPTIONS[cd]
                     amt = capital / len(symbols) / lots if kind == 'eq' else val      # equal weightage: capital / symbols / max lots
@@ -778,7 +814,7 @@ def create_strategies(folder, prefix, exchange, symbols, tfs, capital, sizes, cl
                             + ('' if cdc == 'every' else f' {cdc}')
                             + (f' amt{val:g}' if kind == 'amt' else (' eq' if kind == 'eq' else (f' q{val:g}' if len(sizes) > 1 else '')))
                             + {'below': ' belowcloud', 'inside': ' insidecloud'}.get(ent, '')
-                            + (f' method{mth}' if mth > 1 else ''))
+                            + {2: ' method2', 3: ' method3'}.get(mth, ''))
                     path = os.path.join(d, safe(name) + '.json')
                     if os.path.exists(path):
                         skipped.append(name)
@@ -1248,8 +1284,8 @@ def page_builder():
             lbl('Entry method (one file each)')
             methods = [METHOD_OPTIONS[x] for x in checkbox_dropdown('Select method', list(METHOD_OPTIONS), ['Method 1 - exit at any lot count'], 'method')]
             st.caption('Method 1: profit target exits at ANY lot count.  Method 2: profit target is checked only AFTER all Max lots are filled '
-                       '(span / cloud exits still work any time).  Method 3: scale-in 1 lot per bar, whole position exits ONLY on the crossing day '
-                       '(condition true today, not true on the previous bar; a lot bought today counts as a fresh crossing).')
+                       '(span / cloud exits still work any time).  Method 3: exit when the Close is below the cloud AND the position is in profit, '
+                       'at any lot count (no profit target / span exit needed).')
             c1, c2, c3, c4 = st.columns(4)
             with c1:
                 lbl('Max lots (one file each)')
@@ -1297,37 +1333,55 @@ def page_builder():
 
         with st.container(border=True):                       # ---- EXIT CONDITION
             section_title('Exit condition', 'profit target % on average entry, or Span exit')
-            c = st.columns(3)
-            with c[0]:
-                lbl('Profit target % (one file each)')
-                pct_exits = checkbox_dropdown('Select target', TARGET_OPTIONS, [1, 2], 'exits_pct', fmt=exit_label)
-            with c[1]:
-                lbl('Span exit (one file each)')
-                span_exits = checkbox_dropdown('Select span exit', list(SPAN_ONLY), [], 'exits_span')
-            with c[2]:
-                lbl('Cloud exit (one file each)')
-                cloud_exits = checkbox_dropdown('Select cloud exit', list(CLOUD_EXIT), [], 'exits_cloud')
-            picked_exits = pct_exits + span_exits + cloud_exits
-            lbl('How to use the selected exits')
-            combine = st.radio('Combine', ['One file each', 'AND  (all selected exits must hit)', 'OR  (any one selected exit hits)'],
-                               horizontal=True, label_visibility='collapsed', key='exit_combine')
-            if combine.startswith('One file') or len(picked_exits) < 2:
-                targets = picked_exits
-            else:
-                targets = [('AND' if combine.startswith('AND') else 'OR', picked_exits)]      # ONE file with a combined exit
-                st.caption(f'1 file with exit  {exit_label(targets[0])}')
+            only3 = set(methods) == {3}
+            if only3:
+                st.info('Method 3 exit: the Close is BELOW the cloud and the position is in profit - at any lot count (Max lots need not be filled). '
+                        'No profit target or span exit is needed.')
+            targets = []
+            if not only3:
+                c = st.columns(3)
+                with c[0]:
+                    lbl('Profit target %')
+                    pct_exits = checkbox_dropdown('Select target', TARGET_OPTIONS, [1, 2], 'exits_pct', fmt=exit_label)
+                with c[1]:
+                    lbl('Span exit')
+                    span_exits = checkbox_dropdown('Select span exit', list(SPAN_ONLY), [], 'exits_span')
+                span_dirs = []
+                if span_exits:                                             # shown ONLY after a span is ticked
+                    with c[2]:
+                        lbl('Span exit when price closes')
+                        span_dirs = checkbox_dropdown('Select direction', SPAN_DIRECTION, ['Below span'], 'exits_span_dir')
+                span_dirs = span_dirs or ['Below span']                    # a span ticked with no direction -> Below
+                span_exits = ([x for x in span_exits if 'Below span' in span_dirs]                                  # below the span(s)
+                              + [f'{x} (above)' for x in span_exits if 'Above span' in span_dirs])                   # above the span(s)
+                picked_exits = pct_exits + span_exits
+                lbl('Combine the selected exits (optional)')
+                combine = st.segmented_control('Combine', ['AND  (all selected exits must hit)', 'OR  (any one selected exit hits)'],
+                                               selection_mode='single', default=None, label_visibility='collapsed', key='exit_combine3')
+                if not combine or len(picked_exits) < 2:
+                    targets = picked_exits                                  # nothing chosen -> one file per exit (click again to un-select)
+                else:
+                    targets = [('AND' if combine.startswith('AND') else 'OR', picked_exits)]      # ONE file with a combined exit
+                    st.caption(f'1 file with exit  {exit_label(targets[0])}')
+                if not combine:
+                    st.caption('AND / OR not chosen: every selected exit makes its own file.  Click AND or OR to join them into one file '
+                               '(click it again to un-select).')
 
-        start = now_ist().strftime('%Y-%m-%d %H:%M')          # live only: always start from NOW (no past backfill)
+                if 3 in methods:
+                    st.caption('Method 3 files ignore these exits - they always exit below the cloud while in profit (one extra file).')
+
+        start = now_ist().strftime('%Y-%m-%d %H:%M')          # always starts from NOW (no past backfill)
         symbols, seen = [], set()
         for x in picked + [t.strip() for t in typed_txt.split(',') if t.strip()]:
             if x.upper() not in seen:
                 seen.add(x.upper())
                 symbols.append(x)
-        n = len(symbols) * len(tfs) * len(lots_list) * len(sizes) * len(targets) * len(candles) * len(entries) * len(methods)
+        n_other = len([m for m in methods if m != 3])
+        n = len(symbols) * len(tfs) * len(lots_list) * len(sizes) * len(candles) * len(entries) * (len(targets) * n_other + (1 if 3 in methods else 0))
+        exits_to_save = targets if targets else ([M3_EXIT] if 3 in methods else [])
         st.caption(f'{len(symbols)} symbol(s) x {len(tfs)} timeframe(s) x {len(lots_list)} lots x {len(sizes)} size(s) x '
-                   f'{len(targets)} exits x {len(candles)} candle mode(s) x {len(entries)} entry side(s) x {len(methods)} method(s) = {n} file(s) will be saved.  Start = {start}  '
-                   f'(live - first candle that closes after this)')
-        st.caption('Live trading (real orders) is not included - run Paper first and check the numbers.')
+                   f'{len(targets)} exits x {len(candles)} candle mode(s) x {len(entries)} entry side(s) x {len(methods)} method(s) (Method 3 = 1 fixed exit) = {n} file(s) will be saved.  Start = {start}  '
+                   f'(first candle that closes after this)')
         if st.button('▶ Start', type='primary'):
             fname = (folder or '').strip()
             if not fname:
@@ -1344,9 +1398,9 @@ def page_builder():
                     st.error(str(e))
                     return
                 made, skipped = create_strategies(fname, (prefix or '').strip(), exchange, symbols, tfs, capital, sizes,
-                                                  close_t.strftime('%H:%M'), lots_list, targets, candles, start, entries, methods, int(max_open))
+                                                  close_t.strftime('%H:%M'), lots_list, exits_to_save, candles, start, entries, methods, int(max_open))
                 if made:
-                    st.success(f'Saved {len(made)} file(s) in folder "{fname}". Open "My Strategies" to watch them live.')
+                    st.success(f'Saved {len(made)} PAPER file(s) in folder "{fname}". Paper = numbers only, NO real orders.')
                 if skipped:
                     st.warning(f'{len(skipped)} file(s) already existed and were kept as they are (their start time is unchanged).')
 
@@ -1531,6 +1585,8 @@ def page_file(topic, refresh, fol, fname):
             e1, e2, e3 = st.columns(3)
             ex_opts = EXIT_OPTIONS
             cur_ex = s.get('span') and next(k for k, v in SPAN_OPTIONS.items() if v == s['span']) or s.get('profit')
+            if s.get('method') == 3:
+                e1.caption(f"Exit: {M3_EXIT} (Method 3). Pick an exit below only if you switch the method.")
             if s.get('combo'):
                 e1.caption(f"Exit: {s.get('exit_label')}  (combined exit - create a new file to change it)")
                 new_ex = None
@@ -1553,7 +1609,9 @@ def page_file(topic, refresh, fol, fname):
                 s['lots'], s['capital'], s['candle'] = int(new_lots), new_cap, CANDLE_OPTIONS[new_cd]
                 s['entry'] = ENTRY_OPTIONS[new_entry]
                 s['method'] = METHOD_OPTIONS[new_method]
-                if new_ex is not None:
+                if s['method'] == 3:
+                    s['profit'], s['span'], s['combo'], s['exit_label'] = None, None, None, M3_EXIT
+                elif new_ex is not None:
                     s['profit'] = None if new_ex in SPAN_OPTIONS else new_ex
                     s['span'] = SPAN_OPTIONS.get(new_ex)
                     s['exit_label'] = exit_label(new_ex)
@@ -1799,12 +1857,87 @@ def page_view(topic, refresh):
             is_open = now.weekday() < 5 and open_txt <= now.strftime('%H:%M') <= any_s.get('close', '15:30')
             stale = [ev for ev in evs.values() if ev.get('data_err')]
             checks = [ev['checked'] for ev in evs.values() if ev.get('checked')]
-            msg = (f"🟢 **LIVE**  |  market {'open' if is_open else 'closed'}  |  refreshed {now:%H:%M:%S} (every {int(refresh)}s)  |  "
+            msg = (f"🟢 **RUNNING**  |  market {'open' if is_open else 'closed'}  |  refreshed {now:%H:%M:%S} (every {int(refresh)}s)  |  "
                    f"Angel data checked {ts_ist(max(checks)).strftime('%H:%M:%S') if checks else '-'}  |  {len(evs)} running file(s) OK"
                    + (f"  |  ⏳ {len(loading)} loading candles ..." if loading else ''))
             if errs or stale:
                 msg += f"  |  ⚠️ {len(errs)} error(s), {len(stale)} using last good data (Angel rate limit?)"
             status_ph.markdown(msg)
+
+        w = [3, 1.6, 2, 3.4, 0.7, 0.9, 0.7]
+
+        def render_row(fol, f, s, stats):
+            x = stats[f]
+            total = x['realized'] + x['unreal']
+            pct = total / float(s['capital']) * 100 if s.get('capital') else None
+            r = st.columns(w)
+            if r[0].button('📄 ' + s['name'], key=f'open_{fol}_{f}', type='tertiary'):
+                st.session_state['open_file'] = (fol, f)
+                st.rerun()
+            size = size_text(s)
+            r[0].caption(f"{s['exchange']} · {s['tf']} · {s['lots']} lots · {method_text(s)} · entry {entry_text(s)} · exit {exit_text(s)} · {candle_text(s).lower()} · {size} · {limit_text(s)} · capital {s['capital']:,.0f} · started {s['start']}")
+            r[1].write(s['symbol'])
+            if not s.get('stopped'):
+                try:
+                    tok_ = _instrument_token(s['exchange'], s['symbol'])
+                    get_feed().subscribe(s['exchange'], tok_)
+                    tk_ = get_feed().get(s['exchange'], tok_)
+                    r[1].caption('LTP ' + (f"{tk_['ltp']:,.2f}" if tk_ else '...'))
+                except Exception:
+                    pass
+            dot = {'Running': '🟢', 'Paused': '🟡', 'Stopped': '⚫', 'Error': '🔴', 'Loading': '⏳'}[x['state']]
+            r[2].write(f"{dot} {x['state']}")
+            r[2].caption(x['sub'])
+            r[3].markdown(f"Open **{x['open_n']}** · Closed **{x['closed_n']}** · Realized {pnl_txt(x['realized'])}  \n"
+                          f"Unrealized {pnl_txt(x['unreal'])} · **Total** {pnl_txt(total, pct)}")
+            if r[4].button('📈', key=f'btn_{fol}_{f}', help='Open'):
+                st.session_state['open_file'] = (fol, f)
+                st.rerun()
+            with r[5].popover('Exit', width='stretch', disabled=s.get('stopped', False)):
+                st.write(s['name'])
+                if st.button('✔ Yes', key=f'exit_{fol}_{f}', type='primary'):
+                    exit_strategy(fol, f, evs.get((fol, f)))
+                    st.rerun()
+            with r[6].popover('🗑️', width='stretch'):
+                st.write(s['name'])
+                if st.button('✔ Yes', key=f'del_{fol}_{f}', type='primary'):
+                    delete_strategy(fol, f)
+                    st.rerun()
+            st.divider()
+
+        def render_group(fol, gid, members, stats):
+            """50 stocks that share one 'Max stocks open' limit -> ONE card that folds / unfolds (files stay separate on disk)."""
+            members = sorted(members, key=lambda fs: ((fs[1].get('group') or {}).get('rank', 0), fs[1]['name']))
+            s0 = members[0][1]
+            xs = [stats[f] for f, _ in members]
+            running_n = sum(1 for _, s in members if not s.get('stopped'))
+            held = sum(x['open_n'] for x in xs)
+            real = sum(x['realized'] for x in xs)
+            unreal = sum(x['unreal'] for x in xs)
+            cap = sum(float(s.get('capital') or 0) for _, s in members)
+            lim = (s0.get('group') or {}).get('limit')
+            with st.container(border=True):
+                h = st.columns([6, 1.3, 0.8])
+                h[0].markdown('📄 ' + f"**Group of {len(members)} stocks**  ·  holding **{held} / {lim}**  ·  running {running_n}")
+                h[0].caption(f"{s0['exchange']} · {s0['tf']} · {s0['lots']} lots · {method_text(s0)} · entry {entry_text(s0)} · exit {exit_text(s0)} · "
+                             f"{candle_text(s0).lower()} · {size_text(s0)} · max {lim} stocks at a time · started {s0['start']}")
+                h[0].markdown(f"Realized {pnl_txt(real)} · Unrealized {pnl_txt(unreal)} · **Total** {pnl_txt(real + unreal, (real + unreal) / cap * 100 if cap else None)}")
+                with h[1].popover('Exit group', width='stretch', disabled=running_n == 0):
+                    st.write(f'Stop all running stocks of this group ({running_n})')
+                    if st.button('✔ Yes', key=f'exitgrp_{fol}_{gid}', type='primary'):
+                        for f, s in members:
+                            if not s.get('stopped'):
+                                exit_strategy(fol, f, evs.get((fol, f)))
+                        st.rerun()
+                with h[2].popover('🗑️', width='stretch'):
+                    st.write(f'Delete all {len(members)} files of this group')
+                    if st.button('✔ Yes', key=f'delgrp_{fol}_{gid}', type='primary'):
+                        for f, _ in members:
+                            delete_strategy(fol, f)
+                        st.rerun()
+                if st.toggle(f'Show the {len(members)} stocks', key=f'grpopen_{fol}_{gid}'):
+                    for f, s in members:
+                        render_row(fol, f, s, stats)
 
         for fol in shown:
             files = data[fol]
@@ -1854,48 +1987,19 @@ def page_view(topic, refresh):
                     st.caption('No signal yet - a strategy acts only when a candle CLOSES after its start time.')
                 st.divider()
 
-                w = [3, 1.6, 2, 3.4, 0.7, 0.9, 0.7]
                 hd = st.columns(w)
                 for col, name in zip(hd, ['Name & details', 'Instrument', 'Status', 'P&L', 'Open', 'Exit', 'Del']):
                     col.markdown(f'<span style="opacity:.6;font-weight:600;font-size:14px">{name}</span>', unsafe_allow_html=True)
+                seen_groups = set()
                 for f, s in files:
-                    x = stats[f]
-                    total = x['realized'] + x['unreal']
-                    pct = total / float(s['capital']) * 100 if s.get('capital') else None
-                    r = st.columns(w)
-                    if r[0].button(f"📄 {s['name']}", key=f'open_{fol}_{f}', type='tertiary'):
-                        st.session_state['open_file'] = (fol, f)
-                        st.rerun()
-                    size = size_text(s)
-                    r[0].caption(f"{s['exchange']} · {s['tf']} · {s['lots']} lots · {method_text(s)} · entry {entry_text(s)} · exit {exit_text(s)} · {candle_text(s).lower()} · {size} · {limit_text(s)} · capital {s['capital']:,.0f} · started {s['start']}")
-                    r[1].write(s['symbol'])
-                    if not s.get('stopped'):
-                        try:
-                            tok_ = _instrument_token(s['exchange'], s['symbol'])
-                            get_feed().subscribe(s['exchange'], tok_)
-                            tk_ = get_feed().get(s['exchange'], tok_)
-                            r[1].caption('LTP ' + (f"{tk_['ltp']:,.2f}" if tk_ else '...'))
-                        except Exception:
-                            pass
-                    dot = {'Running': '🟢', 'Paused': '🟡', 'Stopped': '⚫', 'Error': '🔴', 'Loading': '⏳'}[x['state']]
-                    r[2].write(f"{dot} {x['state']}")
-                    r[2].caption(x['sub'])
-                    r[3].markdown(f"Open **{x['open_n']}** · Closed **{x['closed_n']}** · Realized {pnl_txt(x['realized'])}  \n"
-                                  f"Unrealized {pnl_txt(x['unreal'])} · **Total** {pnl_txt(total, pct)}")
-                    if r[4].button('📈', key=f'btn_{fol}_{f}', help='Open'):
-                        st.session_state['open_file'] = (fol, f)
-                        st.rerun()
-                    with r[5].popover('Exit', width='stretch', disabled=s.get('stopped', False)):
-                        st.write(s['name'])
-                        if st.button('✔ Yes', key=f'exit_{fol}_{f}', type='primary'):
-                            exit_strategy(fol, f, evs.get((fol, f)))
-                            st.rerun()
-                    with r[6].popover('🗑️', width='stretch'):
-                        st.write(s['name'])
-                        if st.button('✔ Yes', key=f'del_{fol}_{f}', type='primary'):
-                            delete_strategy(fol, f)
-                            st.rerun()
-                    st.divider()
+                    g_ = s.get('group') or {}
+                    gid = g_.get('id') if g_.get('limit') else None
+                    if gid is None:
+                        render_row(fol, f, s, stats)
+                    elif gid not in seen_groups:
+                        seen_groups.add(gid)
+                        render_group(fol, gid, [(ff, ss) for ff, ss in files
+                                                 if (ss.get('group') or {}).get('limit') and (ss.get('group') or {}).get('id') == gid], stats)
 
         if loading:                                                # candles still downloading in the background
             time.sleep(4)
