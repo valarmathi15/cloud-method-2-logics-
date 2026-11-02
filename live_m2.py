@@ -1935,9 +1935,18 @@ def page_view(topic, refresh):
                         for f, _ in members:
                             delete_strategy(fol, f)
                         st.rerun()
-                if st.toggle(f'Show the {len(members)} stocks', key=f'grpopen_{fol}_{gid}'):
-                    for f, s in members:
+                # ONLY the stocks that really took an entry (holding now, or already traded / exited) are listed.
+                # Stocks that are still waiting for a free slot stay hidden in a separate fold until their 1st entry.
+                active = [(f, s) for f, s in members if stats[f]['open_n'] > 0 or stats[f]['closed_n'] > 0 or s.get('stopped')]
+                waiting = [(f, s) for f, s in members if (f, s) not in active]
+                if st.toggle(f'Show the {len(active)} entered stocks', key=f'grpopen_{fol}_{gid}'):
+                    if not active:
+                        st.caption('No stock has taken an entry yet.')
+                    for f, s in active:
                         render_row(fol, f, s, stats)
+                    if waiting:
+                        with st.expander(f'⏳ {len(waiting)} waiting for a free slot (no entry yet)'):
+                            st.caption(', '.join(s['symbol'] for _, s in waiting))
 
         for fol in shown:
             files = data[fol]
